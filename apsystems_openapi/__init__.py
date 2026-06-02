@@ -4,18 +4,57 @@ from datetime import timedelta
 import asyncio
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.components import persistent_notification
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry as dr
 from homeassistant.util.dt import now, as_local
 from homeassistant.helpers.sun import get_astral_event_next
 from homeassistant.helpers.event import async_track_point_in_utc_time
 
-from .const import DOMAIN, PLATFORMS, DEFAULT_BASE_URL, DEFAULT_INVERTER_SCAN_INTERVAL, INVERTER_LIST_CACHE_SECONDS
-from .api import APSClient
+from .const import (
+    DOMAIN,
+    PLATFORMS,
+    DEFAULT_BASE_URL,
+    API_LIMIT_CODE_MESSAGES,
+    MONTHLY_API_QUOTA,
+    recommended_scan_interval,
+    estimate_monthly_calls,
+)
+from .api import APSClient, APSRateLimitError
 
 import time as _time
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _notify_api_limit(hass: HomeAssistant, err: APSRateLimitError) -> None:
+    """Log and raise a persistent HA notification when the API limit is hit."""
+    reason = API_LIMIT_CODE_MESSAGES.get(err.code, "access limit exceeded")
+    _LOGGER.error(
+        "APsystems API limit exceeded (code %s: %s) on %s. Pausing API calls "
+        "until the limit resets. Increase the scan interval in the integration "
+        "options to stay under the 1000 calls/month quota.",
+        err.code, reason, err.path,
+    )
+    persistent_notification.async_create(
+        hass,
+        title="APsystems: API limit exceeded",
+        message=(
+            f"The APsystems OpenAPI reported **{reason}** (code {err.code}).\n\n"
+            "Data updates are paused until the limit resets. To avoid hitting "
+            "the 1000 calls/month quota, increase the **scan interval** via "
+            "Settings → Devices & Services → APsystems OpenAPI → Configure."
+        ),
+        notification_id=f"{DOMAIN}_api_limit",
+    )
+
+
+def _clear_api_limit_notification(hass: HomeAssistant) -> None:
+    """Dismiss the API-limit notification after a successful API call."""
+    persistent_notification.async_dismiss(hass, f"{DOMAIN}_api_limit")
+
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     data = entry.data  # <— fix
@@ -38,10 +77,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "list": None,                # parsed list of inverter dicts
         "list_fetched_ts": 0,        # epoch when list was last fetched
         "energy": {},                # uid -> energy data dict
-        "energy_fetched_ts": 0,      # epoch when energy was last fetched
-        "energy_date": None,
+        "energy_date": None,         # date string of last fetch
     }
-    inverter_scan = int(data.get("inverter_scan_interval", DEFAULT_INVERTER_SCAN_INTERVAL))
+
+    # Summary tracking state (fetched once per day near end of solar hours)
+    summary_cache = {
+        "data": None,
+        "fetched_date": None,   # date string of last fetch
+    }
+
+    # Batch power tracking state (fetched once per day at 11 PM)
+    batch_power_cache = {
+        "data": {},             # eid -> {time: [...], power: {uid-ch: [...]}}
+        "fetched_date": None,   # date string of last fetch
+    }
 
     def update_solar_state():
         """Check if we're currently in solar hours (30 min after sunrise to sunset)."""
@@ -57,18 +106,103 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         sunset = get_astral_event_date(hass, "sunset", today)
 
         if sunrise and sunset:
-            # Add 30 minute buffer after sunrise
+            # Add 30 minute buffer after sunrise (panels need time to ramp up)
             sunrise_with_buffer = sunrise + timedelta(minutes=30)
-            sunset_with_buffer = sunset + timedelta(minutes=30)
-            solar_active["is_active"] = sunrise_with_buffer <= current_time <= sunset_with_buffer
+            solar_active["is_active"] = sunrise_with_buffer <= current_time <= sunset
+            solar_active["sunset"] = sunset
             _LOGGER.debug(
                 "Solar state updated: active=%s (current=%s, start=%s, end=%s)",
-                solar_active["is_active"], current_time, sunrise_with_buffer, sunset_with_buffer
+                solar_active["is_active"], current_time, sunrise_with_buffer, sunset
             )
         else:
             # Fallback if sun calculation fails
             hour = current_time.hour
             solar_active["is_active"] = 7 <= hour <= 20
+
+    async def refresh_inverter_list():
+        """Fetch the inverter list from the API (called by button or first run)."""
+        try:
+            inv_resp = await client.get_inverters()
+            if isinstance(inv_resp, dict) and inv_resp.get("code") == 0:
+                raw = inv_resp.get("data", [])
+                parsed = []
+                for ecu in (raw if isinstance(raw, list) else []):
+                    eid = ecu.get("eid")
+                    for inv in ecu.get("inverter", []):
+                        parsed.append({
+                            "eid": eid,
+                            "uid": inv.get("uid"),
+                            "type": inv.get("type"),
+                        })
+                inverter_cache["list"] = parsed
+                inverter_cache["list_fetched_ts"] = _time.time()
+                _LOGGER.info("Discovered %d inverter(s)", len(parsed))
+                return parsed
+            else:
+                _LOGGER.warning("Inverter list API error: %s", inv_resp)
+        except APSRateLimitError as exc:
+            _notify_api_limit(hass, exc)
+        except Exception as exc:
+            _LOGGER.warning("Error fetching inverter list: %s", exc)
+        if inverter_cache["list"] is None:
+            inverter_cache["list"] = []
+        return inverter_cache["list"]
+
+    async def refresh_inverter_energy():
+        """Fetch energy data for all inverters (called by button or daily schedule)."""
+        date_str = as_local(now()).date().isoformat()
+        inv_energy = {}
+        for inv in (inverter_cache["list"] or []):
+            uid = inv["uid"]
+            try:
+                resp = await client.get_inverter_energy(uid, date_str, energy_level="minutely")
+                if isinstance(resp, dict) and resp.get("code") == 0:
+                    inv_energy[uid] = resp.get("data", {})
+                elif isinstance(resp, dict) and resp.get("code") == 1001:
+                    _LOGGER.debug("No energy data yet for inverter %s (code 1001)", uid)
+                else:
+                    _LOGGER.warning("Inverter energy error for %s: %s", uid, resp)
+            except APSRateLimitError as exc:
+                _notify_api_limit(hass, exc)
+                break  # limit hit — stop hammering the API for remaining inverters
+            except Exception as exc:
+                _LOGGER.warning("Failed to fetch energy for inverter %s: %s", uid, exc)
+        inverter_cache["energy"] = inv_energy
+        inverter_cache["energy_date"] = date_str
+        _LOGGER.info("Inverter energy fetched for %s (%d inverters)", date_str, len(inv_energy))
+        return inv_energy
+
+    async def refresh_batch_power():
+        """Fetch batch power data for all ECUs (one call per ECU, covers all inverters)."""
+        date_str = as_local(now()).date().isoformat()
+        # Group inverters by ECU
+        ecus = set()
+        for inv in (inverter_cache["list"] or []):
+            eid = inv.get("eid")
+            if eid:
+                ecus.add(eid)
+        batch_data = {}
+        for eid in ecus:
+            try:
+                resp = await client.get_inverter_batch_power(eid, date_str)
+                if isinstance(resp, dict) and resp.get("code") == 0:
+                    batch_data[eid] = resp.get("data", {})
+                else:
+                    _LOGGER.warning("Batch power error for ECU %s: %s", eid, resp)
+            except APSRateLimitError as exc:
+                _notify_api_limit(hass, exc)
+                break  # limit hit — stop hammering the API for remaining ECUs
+            except Exception as exc:
+                _LOGGER.warning("Failed to fetch batch power for ECU %s: %s", eid, exc)
+        batch_power_cache["data"] = batch_data
+        batch_power_cache["fetched_date"] = date_str
+        _LOGGER.info("Batch power fetched for %s (%d ECUs)", date_str, len(batch_data))
+        # Push updated data into the coordinator so sensors see it immediately
+        if coordinator.data is not None:
+            coordinator.data["batch_power"] = batch_power_cache["data"]
+            coordinator.data["batch_power_date"] = batch_power_cache["fetched_date"]
+            coordinator.async_set_updated_data(coordinator.data)
+        return batch_data
 
     async def _async_update():
         """Fetch data from API only during solar hours."""
@@ -76,34 +210,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             update_solar_state()
             now_ts = _time.time()
 
-            # ── Always discover inverters on first run (even at night) ──
-            if inverter_cache["list"] is None or (
-                now_ts - inverter_cache["list_fetched_ts"] > INVERTER_LIST_CACHE_SECONDS
-            ):
-                try:
-                    inv_resp = await client.get_inverters()
-                    if isinstance(inv_resp, dict) and inv_resp.get("code") == 0:
-                        raw = inv_resp.get("data", [])
-                        parsed = []
-                        for ecu in (raw if isinstance(raw, list) else []):
-                            eid = ecu.get("eid")
-                            for inv in ecu.get("inverter", []):
-                                parsed.append({
-                                    "eid": eid,
-                                    "uid": inv.get("uid"),
-                                    "type": inv.get("type"),
-                                })
-                        inverter_cache["list"] = parsed
-                        inverter_cache["list_fetched_ts"] = now_ts
-                        _LOGGER.info("Discovered %d inverter(s)", len(parsed))
-                    else:
-                        _LOGGER.warning("Inverter list API error: %s", inv_resp)
-                        if inverter_cache["list"] is None:
-                            inverter_cache["list"] = []
-                except Exception as exc:
-                    _LOGGER.warning("Error fetching inverter list: %s", exc)
-                    if inverter_cache["list"] is None:
-                        inverter_cache["list"] = []
+            # ── Discover inverters on first run only ──
+            if inverter_cache["list"] is None:
+                await refresh_inverter_list()
 
             # ── Night-time path: return cached data ──
             if not solar_active["is_active"]:
@@ -114,78 +223,85 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     cached.setdefault("inverters", inverter_cache["list"] or [])
                     cached.setdefault("inverter_energy", inverter_cache["energy"])
                     cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
+                    cached.setdefault("batch_power", batch_power_cache["data"])
+                    cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
                     return cached
                 return {
-                    "summary": {"code": 0, "data": {"lifetime": 0, "today": 0, "month": 0, "year": 0}},
-                    "hourly": {"code": 0, "data": []},
+                    "summary": None,
+                    "hourly": None,
                     "date": as_local(now()).date().isoformat(),
                     "solar_active": False,
                     "inverters": inverter_cache["list"] or [],
                     "inverter_energy": inverter_cache["energy"],
                     "inverter_energy_date": inverter_cache["energy_date"],
+                    "batch_power": batch_power_cache["data"],
+                    "batch_power_date": batch_power_cache["fetched_date"],
                 }
 
-            # ── Solar-hours: fetch system data (existing) ──
-            summary = await client.get_system_summary()
-            if summary.get("code") != 0:
-                raise UpdateFailed(f"APsystems summary error: {summary}")
-
+            # ── Solar-hours: fetch hourly (every cycle) ──
             date_str = as_local(now()).date().isoformat()
             hourly = await client.get_system_energy_hourly(date_str)
+            # A successful call means we're under the limit again — clear any notice
+            _clear_api_limit_notification(hass)
             if hourly.get("code") != 0:
                 _LOGGER.warning("APsystems hourly error: %s", hourly)
                 hourly = {"code": 0, "data": []}
 
-            result = {"summary": summary, "hourly": hourly, "date": date_str, "solar_active": True}
+            # ── Summary: fetch once per day near end of solar hours ──
+            need_summary = summary_cache["data"] is None  # first run
+            if not need_summary and summary_cache["fetched_date"] != date_str:
+                # Haven't fetched today yet — wait until last cycle before sunset
+                sunset_time = solar_active.get("sunset")
+                current_time = as_local(now())
+                if sunset_time and current_time + timedelta(seconds=scan_interval) >= sunset_time:
+                    need_summary = True
+                    _LOGGER.debug("Near end of solar day, fetching daily summary")
+            if need_summary:
+                summary = await client.get_system_summary()
+                if summary.get("code") != 0:
+                    _LOGGER.warning("APsystems summary error: %s", summary)
+                    if summary_cache["data"] is None:
+                        raise UpdateFailed(f"APsystems summary error: {summary}")
+                else:
+                    summary_cache["data"] = summary
+                    summary_cache["fetched_date"] = date_str
+                    _LOGGER.info("Daily summary fetched for %s", date_str)
 
-            # ── Inverter energy: fetch on slower schedule ──
-            if now_ts - inverter_cache["energy_fetched_ts"] >= inverter_scan:
-                inv_energy = {}
-                for inv in (inverter_cache["list"] or []):
-                    uid = inv["uid"]
-                    try:
-                        resp = await client.get_inverter_energy(uid, date_str)
-                        if isinstance(resp, dict) and resp.get("code") == 0:
-                            inv_energy[uid] = resp.get("data", {})
-                        else:
-                            _LOGGER.warning("Inverter energy error for %s: %s", uid, resp)
-                    except Exception as exc:
-                        _LOGGER.warning("Failed to fetch energy for inverter %s: %s", uid, exc)
-                inverter_cache["energy"] = inv_energy
-                inverter_cache["energy_fetched_ts"] = now_ts
-                inverter_cache["energy_date"] = date_str
+            result = {"summary": summary_cache["data"], "hourly": hourly, "date": date_str, "solar_active": True}
 
-                # Log budget estimate
-                n_inv = len(inverter_cache["list"] or [])
-                solar_h = 11  # rough average
-                sys_calls = (solar_h * 3600 / scan_interval) * 2
-                inv_calls = (solar_h * 3600 / inverter_scan) * n_inv
-                est_monthly = int((sys_calls + inv_calls + 1) * 30)
-                _LOGGER.info(
-                    "Estimated monthly API calls: ~%d/1000 "
-                    "(%d inverters, system every %ds, inverters every %ds)",
-                    est_monthly, n_inv, scan_interval, inverter_scan,
-                )
-                if est_monthly > 900:
-                    _LOGGER.warning(
-                        "API budget estimate (%d/mo) is close to/exceeds the 1000/mo limit! "
-                        "Consider increasing inverter_scan_interval.",
-                        est_monthly,
-                    )
+            # ── Inverter energy: fetch once per day at 12:30 ──
+            current_time = as_local(now())
+            past_1230 = current_time.hour > 12 or (current_time.hour == 12 and current_time.minute >= 30)
+            if past_1230 and inverter_cache["energy_date"] != date_str:
+                await refresh_inverter_energy()
 
             result["inverters"] = inverter_cache["list"] or []
             result["inverter_energy"] = inverter_cache["energy"]
             result["inverter_energy_date"] = inverter_cache["energy_date"]
+            result["batch_power"] = batch_power_cache["data"]
+            result["batch_power_date"] = batch_power_cache["fetched_date"]
 
             last_data.update(result)
             return result
+        except APSRateLimitError as e:
+            _notify_api_limit(hass, e)
+            # Serve cached data so entities stay available instead of going
+            # unavailable, which would hide the real cause from the user.
+            if last_data["summary"]:
+                cached = dict(last_data)
+                cached["solar_active"] = solar_active.get("is_active", False)
+                cached.setdefault("inverters", inverter_cache["list"] or [])
+                cached.setdefault("inverter_energy", inverter_cache["energy"])
+                cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
+                cached.setdefault("batch_power", batch_power_cache["data"])
+                cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
+                return cached
+            raise UpdateFailed(str(e)) from e
         except Exception as e:
             raise UpdateFailed(str(e)) from e
 
-    # Use a 30 minute interval to stay under API limits
-    # Note summer: ~13.75 hours * 2 queries/hour * 30 = 825 queries/month
-    # Switched to 60 minutes
-    scan_interval = int(data.get("scan_interval", 3600))  # Default 60 minutes
+    # Default 30-minute interval (~960 API calls/month with 6 inverters)
+    scan_interval = int(data.get("scan_interval", 1800))  # Default 30 minutes
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -195,6 +311,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
 
     await coordinator.async_config_entry_first_refresh()
+
+    # ── Auto scan-interval ──────────────────────────────────────────────────
+    # Once inverters are discovered, size the polling interval to the site's
+    # longest day (from HA's configured latitude) and the inverter/ECU count so
+    # the busiest month stays under the 1000 calls/month quota.
+    if data.get("auto_scan_interval", True):
+        inverters = inverter_cache["list"] or []
+        num_inverters = len(inverters)
+        num_ecus = len({inv.get("eid") for inv in inverters if inv.get("eid")}) or 1
+        latitude = hass.config.latitude
+        if num_inverters and latitude is not None:
+            recommended = recommended_scan_interval(latitude, num_inverters, num_ecus)
+            est = estimate_monthly_calls(recommended, latitude, num_inverters, num_ecus)
+            _LOGGER.info(
+                "Auto scan-interval: %ds (%.0f min) for %d inverter(s)/%d ECU(s) "
+                "at lat %.2f — est. %d calls/month (quota %d)",
+                recommended, recommended / 60, num_inverters, num_ecus,
+                latitude, est, MONTHLY_API_QUOTA,
+            )
+            scan_interval = recommended
+            coordinator.update_interval = timedelta(seconds=recommended)
+        else:
+            _LOGGER.debug(
+                "Auto scan-interval skipped (inverters=%d, latitude=%s); "
+                "using configured %ds",
+                num_inverters, latitude, scan_interval,
+            )
+
+    # ── Auto-remove stale inverter devices ──────────────────────────────────
+    # When an inverter no longer appears in the API response, remove its device
+    # (and its entities) from the registry so the UI doesn't show stale tiles.
+    def _prune_stale_inverter_devices() -> None:
+        inverters = (coordinator.data or {}).get("inverters")
+        # Only prune once we have a valid (non-empty) inverter list, otherwise a
+        # transient empty response would wipe all inverter devices.
+        if not inverters:
+            return
+        sid = data["sid"]
+        live_ids = {sid} | {inv["uid"] for inv in inverters if inv.get("uid")}
+        device_reg = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(device_reg, entry.entry_id):
+            device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
+            if device_ids and device_ids.isdisjoint(live_ids):
+                _LOGGER.info(
+                    "Removing stale APsystems inverter device %s (no longer reported)",
+                    ", ".join(sorted(device_ids)),
+                )
+                device_reg.async_update_device(
+                    device.id, remove_config_entry_id=entry.entry_id
+                )
+
+    # Prune now and on every subsequent coordinator update.
+    _prune_stale_inverter_devices()
+    entry.async_on_unload(coordinator.async_add_listener(_prune_stale_inverter_devices))
 
     # Set up sunrise/sunset event listeners to trigger updates
     async def handle_sun_event(event):
@@ -223,14 +393,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             async_track_point_in_utc_time(hass, handle_sun_event, delayed_sunset)
             _LOGGER.info("Scheduled update for 30 minutes after sunset: %s", delayed_sunset)
 
+    # Schedule batch power fetch at 11 PM daily
+    async def schedule_batch_power(now_time):
+        """Schedule batch power fetch at 11 PM local time, re-scheduling for the next day."""
+        import datetime
+        local_now = as_local(now())
+        target = local_now.replace(hour=23, minute=0, second=0, microsecond=0)
+        if local_now >= target:
+            target += timedelta(days=1)
+        async def _run_batch(event):
+            await refresh_batch_power()
+            # Re-schedule for the next day
+            await schedule_batch_power(now())
+        async_track_point_in_utc_time(hass, _run_batch, target)
+        _LOGGER.info("Scheduled batch power fetch at %s", target)
+
+    # Schedule midnight coordinator refresh to reset daily sensors
+    async def schedule_midnight_refresh(now_time):
+        """Schedule a coordinator refresh at midnight to reset daily sensors."""
+        local_now = as_local(now())
+        target = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        async def _run_midnight(event):
+            _LOGGER.info("Midnight refresh: resetting daily sensor data")
+            await coordinator.async_request_refresh()
+            await schedule_midnight_refresh(now())
+        async_track_point_in_utc_time(hass, _run_midnight, target)
+        _LOGGER.info("Scheduled midnight refresh at %s", target)
+
     # Schedule the initial sun events
     await schedule_sunrise_update(now())
     await schedule_sunset_update(now())
+    await schedule_batch_power(now())
+    await schedule_midnight_refresh(now())
 
-    # Store everything needed for sensors
+    # Store everything needed for sensors and button
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "client": client,
         "coordinator": coordinator,
+        "refresh_inverter_list": refresh_inverter_list,
+        "refresh_inverter_energy": refresh_inverter_energy,
+        "refresh_batch_power": refresh_batch_power,
         "sun_handlers": {
             "sunrise": schedule_sunrise_update,
             "sunset": schedule_sunset_update
@@ -245,3 +447,32 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if unloaded:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unloaded
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow manual deletion of an inverter device from the UI.
+
+    The main system device cannot be removed (delete the integration instead).
+    An inverter device may be removed when it is no longer reported by the API;
+    if it is still live it will simply be re-created on the next update.
+    """
+    sid = entry.data["sid"]
+    device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
+
+    # Never allow removing the top-level system device via this dialog.
+    if sid in device_ids:
+        return False
+
+    store = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    coordinator = store["coordinator"] if store else None
+    live_uids = {
+        inv["uid"]
+        for inv in ((coordinator.data or {}).get("inverters", []) if coordinator else [])
+        if inv.get("uid")
+    }
+
+    # Allow removal only if none of this device's inverters are still reported.
+    return device_ids.isdisjoint(live_uids)
+

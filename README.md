@@ -2,7 +2,7 @@
 
 # FORKED FROM https://blackhole.nmrc.org/solar/apsystems-openapi
 
-This is a custom [Home Assistant](https://www.home-assistant.io/) integration for pulling **lifetime** and **daily** solar production data from the [APsystems OpenAPI](https://file.apsystemsema.com:8083/apsystems/resource/openapi/Apsystems_OpenAPI_User_Manual_End_User_EN.pdf). It is designed to integrate with the **Energy dashboard** and also provide today's production plus hourly production breakdowns, pulling data into Home Assistant from your APsystems account on their [Energy Monitoring & Analysis (EMA) System](https://www.apsystemsema.com/ema/index.action).
+This is a custom [Home Assistant](https://www.home-assistant.io/) integration for pulling **lifetime** and **daily** solar production data from the [APsystems OpenAPI](https://file.apsystemsema.com:8083/apsystems/resource/openapi/Apsystems_OpenAPI_User_Manual_End_User_EN.pdf). It is designed to integrate with the **Energy dashboard** and also provide today's production plus hourly production breakdowns and per-inverter telemetry, pulling data into Home Assistant from your APsystems account on their [Energy Monitoring & Analysis (EMA) System](https://www.apsystemsema.com/ema/index.action).
 
 A quick note: I was originally using a modified version of a similar tool but it had multiple bugs, seemed to work better in the EU for  some reason, and required a lot of modifications to make it work on my system, so I opted to rewrite the entire thing from scratch. So far all of the errors I was getting have gone away. Please note this was tested on Home Assistant 2025.8.0 so while it might work on different versions, some of the referenced menu items in HA might be different than what is referenced here.
 
@@ -12,13 +12,17 @@ A quick note: I was originally using a modified version of a similar tool but it
 
 - **Lifetime total kWh** (monotonic increasing) for use in the Energy dashboard
 - **Today’s total kWh** (resets daily) for quick daily monitoring
-- **Per-inverter AC power** (W) — each micro-inverter discovered automatically and exposed as its own device/sensor
-- Per-inverter DC channel 1 & 2 power, peak values, and full hourly time series (exposed as sensor attributes)
+- **Per-inverter sensors** — each micro-inverter is discovered automatically and exposed as its own device with sensors for AC power, DC power (ch 1 & 2), DC voltage (ch 1 & 2), DC current (ch 1 & 2), AC voltage, grid frequency and temperature
+- Peak values and full hourly time series exposed as sensor attributes
 - Hourly production values for the current day, exposed as attributes
-- Configurable polling intervals (system and inverter data fetched on independent schedules)
-- API budget awareness — logs monthly call estimates and warns when approaching the 1000/month limit
-- Solar-hours-only polling with sunrise/sunset awareness to conserve API calls
-- Uses **Home Assistant Config Flow** (no YAML required)
+- **Automatic polling interval** — sizes the scan interval to your site's latitude and inverter/ECU count so the busiest month of the year stays under the 1000 calls/month API quota (can be disabled in favour of a fixed interval)
+- **Solar-hours-only polling** with sunrise/sunset awareness to conserve API calls
+- **API budget awareness** — logs monthly call estimates and raises a persistent Home Assistant notification when the API reports the limit was exceeded
+- **Tolerant JSON parsing** — accepts valid JSON even when the API returns an unexpected content-type (e.g. `application/octet-stream`)
+- **Automatic stale-inverter cleanup** — inverters no longer reported by the API are removed from the device registry, and can also be removed manually from the UI
+- Manual refresh buttons for the inverter list and inverter energy data
+- Ships its own **brand icon** (via a local `brand/` folder, Home Assistant 2026.3+) so the integration logo shows in the UI without a brands-repo submission
+- Uses **Home Assistant Config Flow** with an options flow (no YAML required)
 - Includes debug logging for easy troubleshooting
 
 ---
@@ -37,12 +41,18 @@ Your structure should look like:
 config/
 	custom_components/
 		apsystems_openapi/
-			init.py
+			__init__.py
 			api.py
+			button.py
 			config_flow.py
 			const.py
 			manifest.json
 			sensor.py
+			brand/
+				icon.png
+				icon@2x.png
+			translations/
+				en.json
 ```
 
 2. Restart Home Assistant.
@@ -55,24 +65,48 @@ config/
 - **App ID**: Provided by APsystems after API access approval
 - **App Secret**: Provided by APsystems
 - **System ID (SID)**: Found in your EMA portal
-- **Base URL**: Typically the default `https://api.apsystemsema.com:9282` will work, adjust for your region if needed
-- **Scan interval**: Seconds between system-level updates (default 6000s). Controls how often lifetime/today/hourly system energy is fetched.
-- **Inverter scan interval**: Seconds between per-inverter energy fetches (default 14400s = 4 hours, range 1h–24h). Each fetch makes one API call per inverter.
-- **Sunrise/Sunset offsets**: Minutes to wait after sunrise/before stopping after sunset (default 30 each)
+- **API base URL**: Typically the default `https://api.apsystemsema.com:9282` will work, adjust for your region if needed
+- **Automatically optimise polling interval**: When enabled (default), the integration sizes the polling interval automatically to stay within the API quota based on your Home Assistant latitude and the number of inverters/ECUs discovered
+- **Polling interval (seconds)**: The fixed interval used when automatic optimisation is disabled. Range 1800–7200 (30 min – 2 h), default 1800 (30 min)
+- **Sunrise offset / Sunset offset**: Minutes to wait after sunrise before starting, and after sunset before stopping, API calls (0–120, default 30 each)
 
 6. Save and wait for the first update.
+
+You can change the **automatic optimisation** and **polling interval** at any time later via **Settings → Devices & Services → APsystems OpenAPI → Configure**.
+
+---
+
+## Polling schedule
+
+To stay within the API budget, different data is fetched on different schedules:
+
+| Data | When fetched | API calls |
+| ---- | ------------ | --------- |
+| Hourly system energy | Every poll during solar hours | 1 per cycle |
+| Daily summary (lifetime/month/year) | Once per day near the end of solar hours | 1/day |
+| Per-inverter energy | Once per day at 12:30 | 1 per inverter |
+| Batch power (per ECU) | Once per day at 23:00 | 1 per ECU |
+| Inverter list discovery | First run, then on demand via the **Scan Inverters** button | 1 |
+
+Solar hours run from 30 minutes after sunrise (plus your configured offset) until sunset, so no API calls are made overnight.
 
 ---
 
 ## Inverter Sensors
 
-On first startup the integration calls the APsystems inverter discovery endpoint and creates one **power sensor** per micro-inverter. Each inverter appears as its own device in Home Assistant, linked to the parent system.
+On first startup the integration calls the APsystems inverter discovery endpoint and creates a set of sensors per micro-inverter. Each inverter appears as its own device in Home Assistant, linked to the parent system.
 
-| Entity | Description |
-| ------ | ----------- |
-| `sensor.inverter_<UID>_power` | Latest AC output power (W) |
+| Sensor (entity name) | Description |
+| -------------------- | ----------- |
+| `Power` | Latest AC output power (W) |
+| `DC Power Ch1` / `DC Power Ch2` | Latest DC power per channel (W) |
+| `DC Voltage Ch1` / `DC Voltage Ch2` | Latest DC voltage per channel (V) |
+| `DC Current Ch1` / `DC Current Ch2` | Latest DC current per channel (A) |
+| `AC Voltage` | Latest grid voltage (V) |
+| `Frequency` | Latest grid frequency (Hz) |
+| `Temperature` | Latest inverter temperature (°C) |
 
-Each inverter sensor also exposes the following **attributes**:
+The `Power` sensor also exposes the following **attributes**:
 
 | Attribute | Description |
 | --------- | ----------- |
@@ -87,21 +121,34 @@ Each inverter sensor also exposes the following **attributes**:
 | `inverter_type` | Model type reported by the API |
 | `ecu_id` | ECU the inverter is connected to |
 
-Inverter data is fetched on a slower schedule than system data to conserve your API budget. The inverter list itself is cached for 24 hours.
+Inverter telemetry is fetched on a slower schedule than system data to conserve your API budget.
+
+### Removing inverters
+
+If an inverter is decommissioned and no longer appears in the API response, its device (and all of its sensors) is **removed automatically** on the next update. You can also remove a stale inverter manually from its device page (**⋮ → Delete**). A device that is still being reported by the API cannot be deleted manually — it would simply be re-created on the next poll.
+
+### Manual refresh buttons
+
+Two buttons are exposed on the main system device:
+
+| Button | Action |
+| ------ | ------ |
+| `Scan Inverters` | Re-fetches the inverter list (picks up newly added inverters) |
+| `Refresh Inverter Data` | Forces an immediate per-inverter energy fetch |
 
 ---
 
 ## Adding to the Energy Dashboard
 
 1. Go to **Settings → Dashboards → Energy**.
-2. Under **Solar production**, select **`sensor.apsystems_total_energy_kwh`**.
+2. Under **Solar production**, select the **Total Energy** sensor of your APsystems system (e.g. `sensor.apsystems_<sid>_total_energy`).
 - This sensor has:
   - `device_class: energy`
   - `state_class: total_increasing`
   - Unit: `kWh`
 3. Save changes.
 
-> **WARNING:** Do not use `sensor.apsystems_today_energy_kwh` in the Energy dashboard — it resets daily and will break the Energy graph.  
+> **WARNING:** Do not use the **Today Energy** sensor in the Energy dashboard — it resets daily and will break the Energy graph.  
 > You *can* use it in Lovelace cards for at-a-glance daily totals.
 
 ---
@@ -142,7 +189,8 @@ APS https://api.apsystemsema.com:9282/... → 200 {"code":0,"data":{...}}
 | ------- | -------------- | --- |
 | code:4000 in logs | Wrong signing string (RequestPath must be last segment), wrong App ID/Secret, or clock drift | Check that your HA host clock is correct; verify credentials; sign only last URL segment |
 | code:5000 from hourly endpoint | No hourly data available yet or transient API error | Usually resolves on next update |
-| Old APsystems integration causing conflicts | Old domain/folder still present | Remove the old folder in custom_components/, delete old integration entry, disble old items in Energy dashboard if present, restart HA |
+| code:2005 / 7001 / 7002 / 7003 + "API limit exceeded" notification | Monthly quota or server rate limit reached | Leave automatic optimisation on, or increase the scan interval via **Configure**; data resumes when the limit resets |
+| Old APsystems integration causing conflicts | Old domain/folder still present | Remove the old folder in custom_components/, delete old integration entry, disable old items in Energy dashboard if present, restart HA |
 
 You can also download and use `apsystems_testcreds.py` (you might have to `pip install aiohttp` first) to help with troubleshooting credential usage outside of Home Assistant. Simply edit it and add your credentials, or use the command line. It is located [here](apsystems_test_apps/apsystems_testcreds.py).
 
@@ -162,6 +210,12 @@ options:
   --date DATE           YYYY-MM-DD for hourly test (default: today)
 ```
 
+A self-contained unit test for the JSON content-type handling (no credentials or network required) can be run with:
+
+```
+$ python3 apsystems_test_apps/test_json_mimetype.py
+```
+
 ## Credits
 
 Based on the official [APsystems OpenAPI User Manual](https://file.apsystemsema.com:8083/apsystems/resource/openapi/Apsystems_OpenAPI_User_Manual_End_User_EN.pdf).
@@ -170,29 +224,31 @@ Built and tested with APsystems EMA accounts.
 
 ## API Budget
 
-APsystems enforces a limit of **1000 API calls per month**. The integration makes the following calls during solar hours:
+APsystems enforces a limit of **1000 API calls per month**. During solar hours the integration makes:
 
-- **2 calls per system poll** (summary + hourly energy)
-- **1 call per inverter per inverter poll** (per-inverter energy)
-- **1 call per day** for inverter list discovery (cached 24h)
+- **1 call per poll** for hourly system energy
+- **1 call per day** for the daily summary
+- **1 call per inverter per day** for per-inverter energy (at 12:30)
+- **1 call per ECU per day** for batch power (at 23:00)
+- **1 call per day** for inverter list discovery (first run / on demand)
 
-Estimated monthly usage (assuming ~11 solar hours/day, 30 days):
+Because the length of the solar window varies seasonally, the **busiest month is summer**. With automatic optimisation enabled, the integration solves for the smallest interval that keeps the worst-case month under the quota (with head-room) using your latitude and inverter/ECU count, clamped to the 30 min – 2 h range.
 
-| Inverters | `scan_interval` | `inverter_scan_interval` | Est. calls/month |
-|:---------:|:----------------:|:------------------------:|:-----------------:|
-| 6 | 6000s (default) | 14400s (4h, default) | ~921 |
-| 6 | 3600s (1h) | 28800s (8h) | ~937 |
-| 10 | 6000s | 14400s (4h) | ~1070 — increase inverter interval |
-| 10 | 6000s | 21600s (6h) | ~960 |
+Rough worst-case guidance (6 inverters, 1 ECU, ~11–15 h summer days):
 
-The integration logs an estimate after each inverter fetch and warns if the projection exceeds 900/month. Check your Home Assistant logs for lines like:
+| Scan interval | Summer (L≈15 h) | Shoulder (L≈11 h) | Winter (L≈8 h) |
+|:-------------:|:---------------:|:-----------------:|:--------------:|
+| 1800 s (30 min) | ~1170 ⚠️ over quota | ~930 | ~720 |
+| 3600 s (60 min) | ~720 | ~600 | ~510 |
+
+The default fixed interval of 30 min can exceed the quota on long summer days, which is exactly why automatic optimisation is enabled by default. After discovery the integration logs the chosen interval and its estimated monthly usage, e.g.:
 
 ```
-Estimated monthly API calls: ~921/1000 (6 inverters, system every 6000s, inverters every 14400s)
+Auto scan-interval: 3600s (60 min) for 6 inverter(s)/1 ECU(s) at lat 51.50 — est. 690 calls/month (quota 1000)
 ```
 
 ---
 
 ## Disclaimer
 
-This is not an official APsystems integration. Use at your own risk. Be mindful of APsystems API request limits — the defaults are tuned to stay under 1000 calls/month for systems with up to 6 inverters.
+This is not an official APsystems integration. Use at your own risk. Be mindful of APsystems API request limits — the automatic interval is tuned to stay under 1000 calls/month, but you remain responsible for your own API usage.

@@ -1,0 +1,49 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "APsystems OpenAPI",
+        "description": "Enter your APsystems OpenAPI credentials and polling preferences.",
+        "data": {
+          "app_id": "App ID",
+          "app_secret": "App Secret",
+          "sid": "System ID (SID)",
+          "base_url": "API base URL",
+          "auto_scan_interval": "Automatically optimise polling interval",
+          "scan_interval": "Polling interval (seconds)",
+          "sunrise_offset": "Sunrise offset (minutes)",
+          "sunset_offset": "Sunset offset (minutes)"
+        },
+        "data_description": {
+          "auto_scan_interval": "When enabled, the polling interval is sized automatically to stay within the API quota. Disable to use the fixed interval below.",
+          "scan_interval": "Seconds between API calls during solar hours (1800–7200, default 1800 = 30 min). Ignored when automatic optimisation is enabled.",
+          "sunrise_offset": "Minutes to wait after sunrise before starting API calls (0–120, default 30).",
+          "sunset_offset": "Minutes to wait after sunset before stopping API calls (0–120, default 30)."
+        }
+      }
+    },
+    "error": {
+      "auth": "Authentication failed. Check your App ID, App Secret and System ID.",
+      "cannot_connect": "Could not connect to the APsystems API. Check your network and base URL."
+    },
+    "abort": {
+      "already_configured": "This System ID is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "APsystems OpenAPI options",
+        "description": "Adjust how often the integration polls the APsystems API.",
+        "data": {
+          "auto_scan_interval": "Automatically optimise polling interval",
+          "scan_interval": "Polling interval (seconds)"
+        },
+        "data_description": {
+          "auto_scan_interval": "When enabled, the polling interval is sized automatically to stay within the API quota. Disable to use the fixed interval below.",
+          "scan_interval": "Seconds between API calls during solar hours (1800–7200, default 1800 = 30 min). Ignored when automatic optimisation is enabled."
+        }
+      }
+    }
+  }
+}
