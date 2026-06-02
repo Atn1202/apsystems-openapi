@@ -1,5 +1,4 @@
-import base64, hmac, hashlib, time, uuid, aiohttp, logging
-from urllib.parse import urlencode
+import base64, hmac, hashlib, time, uuid, aiohttp, logging, json
 
 try:
     # Normal Home Assistant package import.
@@ -77,7 +76,10 @@ class APSClient:
             txt = await r.text()
             _LOGGER.debug("APS %s → %s %s", url, r.status, txt[:500])
             r.raise_for_status()
-            data = await r.json()
+            # Parse the body ourselves rather than r.json(): the APsystems API
+            # sometimes returns valid JSON with an unexpected content-type
+            # (e.g. application/octet-stream), which aiohttp's r.json() rejects.
+            data = json.loads(txt)
             code = data.get("code") if isinstance(data, dict) else None
             if code in API_LIMIT_CODES:
                 reason = API_LIMIT_CODE_MESSAGES.get(code, "access limit exceeded")

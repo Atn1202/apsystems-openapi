@@ -7,6 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.components import persistent_notification
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers import device_registry as dr
 from homeassistant.util.dt import now, as_local
 from homeassistant.helpers.sun import get_astral_event_next
 from homeassistant.helpers.event import async_track_point_in_utc_time
@@ -338,6 +339,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 num_inverters, latitude, scan_interval,
             )
 
+    # ── Auto-remove stale inverter devices ──────────────────────────────────
+    # When an inverter no longer appears in the API response, remove its device
+    # (and its entities) from the registry so the UI doesn't show stale tiles.
+    def _prune_stale_inverter_devices() -> None:
+        inverters = (coordinator.data or {}).get("inverters")
+        # Only prune once we have a valid (non-empty) inverter list, otherwise a
+        # transient empty response would wipe all inverter devices.
+        if not inverters:
+            return
+        sid = data["sid"]
+        live_ids = {sid} | {inv["uid"] for inv in inverters if inv.get("uid")}
+        device_reg = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(device_reg, entry.entry_id):
+            device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
+            if device_ids and device_ids.isdisjoint(live_ids):
+                _LOGGER.info(
+                    "Removing stale APsystems inverter device %s (no longer reported)",
+                    ", ".join(sorted(device_ids)),
+                )
+                device_reg.async_update_device(
+                    device.id, remove_config_entry_id=entry.entry_id
+                )
+
+    # Prune now and on every subsequent coordinator update.
+    _prune_stale_inverter_devices()
+    entry.async_on_unload(coordinator.async_add_listener(_prune_stale_inverter_devices))
+
     # Set up sunrise/sunset event listeners to trigger updates
     async def handle_sun_event(event):
         """Handle sunrise/sunset events."""
@@ -419,3 +447,32 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if unloaded:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unloaded
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Allow manual deletion of an inverter device from the UI.
+
+    The main system device cannot be removed (delete the integration instead).
+    An inverter device may be removed when it is no longer reported by the API;
+    if it is still live it will simply be re-created on the next update.
+    """
+    sid = entry.data["sid"]
+    device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
+
+    # Never allow removing the top-level system device via this dialog.
+    if sid in device_ids:
+        return False
+
+    store = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    coordinator = store["coordinator"] if store else None
+    live_uids = {
+        inv["uid"]
+        for inv in ((coordinator.data or {}).get("inverters", []) if coordinator else [])
+        if inv.get("uid")
+    }
+
+    # Allow removal only if none of this device's inverters are still reported.
+    return device_ids.isdisjoint(live_uids)
+

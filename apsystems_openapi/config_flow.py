@@ -24,13 +24,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None):
         if user_input is None:
             return self.async_show_form(
-                step_id="user", 
+                step_id="user",
                 data_schema=STEP_USER_DATA_SCHEMA,
-                description_placeholders={
-                    "scan_interval_help": "Seconds between API calls during solar hours (default 3600 = 60 min)",
-                    "sunrise_offset_help": "Minutes to wait after sunrise before starting API calls (default 30)",
-                    "sunset_offset_help": "Minutes to wait after sunset before stopping API calls (default 30)",
-                }
             )
         session = async_get_clientsession(self.hass)
         client = APSClient(
