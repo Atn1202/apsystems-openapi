@@ -12,6 +12,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema({
     vol.Required("app_secret"): str,
     vol.Required("sid", description="System ID as shown in EMA"): str,
     vol.Optional("base_url", default=DEFAULT_BASE_URL): str,
+    vol.Optional("auto_scan_interval", default=True): bool,  # auto-size to stay under quota
     vol.Optional("scan_interval", default=1800): vol.All(int, vol.Range(min=1800, max=7200)),  # 30 min to 2 hours
     vol.Optional("sunrise_offset", default=30): vol.All(int, vol.Range(min=0, max=120)),  # minutes after sunrise
     vol.Optional("sunset_offset", default=30): vol.All(int, vol.Range(min=0, max=120)),  # minutes after sunset
@@ -71,6 +72,7 @@ class APSOptionsFlow(config_entries.OptionsFlow):
 
         current = self._entry.data
         schema = vol.Schema({
+            vol.Optional("auto_scan_interval", default=current.get("auto_scan_interval", True)): bool,
             vol.Optional("scan_interval", default=current.get("scan_interval", 1800)): vol.All(
                 int, vol.Range(min=1800, max=7200)
             ),

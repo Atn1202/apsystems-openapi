@@ -1,7 +1,41 @@
 import base64, hmac, hashlib, time, uuid, aiohttp, logging
 from urllib.parse import urlencode
 
+try:
+    # Normal Home Assistant package import.
+    from .const import API_LIMIT_CODES, API_LIMIT_CODE_MESSAGES
+except ImportError:
+    # Fallback for the test harness, which loads api.py standalone (no package
+    # context) via importlib and therefore can't resolve a relative import.
+    import importlib.util as _ilu
+    import pathlib as _pl
+
+    _spec = _ilu.spec_from_file_location(
+        "aps_const", _pl.Path(__file__).resolve().parent / "const.py"
+    )
+    _const = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_const)
+    API_LIMIT_CODES = _const.API_LIMIT_CODES
+    API_LIMIT_CODE_MESSAGES = _const.API_LIMIT_CODE_MESSAGES
+
 _LOGGER = logging.getLogger(__name__)
+
+
+class APSRateLimitError(Exception):
+    """Raised when APsystems reports the API access/rate limit was exceeded.
+
+    The API returns HTTP 200 with a non-zero ``code`` in the JSON body (e.g.
+    2005 = monthly account quota exceeded, 7001/7002/7003 = server rate limit),
+    so this condition is otherwise silently swallowed by callers that only
+    inspect ``code == 0``.
+    """
+
+    def __init__(self, code: int, path: str):
+        self.code = code
+        self.path = path
+        reason = API_LIMIT_CODE_MESSAGES.get(code, "access limit exceeded")
+        super().__init__(f"APsystems API {reason} (code {code}) on {path}")
+
 
 def _build_signature(app_id, app_secret, path, method):
     ts = str(int(time.time() * 1000))        # milliseconds
@@ -43,7 +77,18 @@ class APSClient:
             txt = await r.text()
             _LOGGER.debug("APS %s → %s %s", url, r.status, txt[:500])
             r.raise_for_status()
-            return await r.json()
+            data = await r.json()
+            code = data.get("code") if isinstance(data, dict) else None
+            if code in API_LIMIT_CODES:
+                reason = API_LIMIT_CODE_MESSAGES.get(code, "access limit exceeded")
+                _LOGGER.error(
+                    "APsystems API %s (code %s) on %s — no further data will be "
+                    "fetched until the limit resets. Increase the scan interval "
+                    "to stay under the 1000 calls/month quota.",
+                    reason, code, path,
+                )
+                raise APSRateLimitError(code, path)
+            return data
 
     async def get_system_summary(self):
         return await self._get(f"/user/api/v2/systems/summary/{self.sid}")

@@ -4,18 +4,56 @@ from datetime import timedelta
 import asyncio
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.components import persistent_notification
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util.dt import now, as_local
 from homeassistant.helpers.sun import get_astral_event_next
 from homeassistant.helpers.event import async_track_point_in_utc_time
 
-from .const import DOMAIN, PLATFORMS, DEFAULT_BASE_URL
-from .api import APSClient
+from .const import (
+    DOMAIN,
+    PLATFORMS,
+    DEFAULT_BASE_URL,
+    API_LIMIT_CODE_MESSAGES,
+    MONTHLY_API_QUOTA,
+    recommended_scan_interval,
+    estimate_monthly_calls,
+)
+from .api import APSClient, APSRateLimitError
 
 import time as _time
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _notify_api_limit(hass: HomeAssistant, err: APSRateLimitError) -> None:
+    """Log and raise a persistent HA notification when the API limit is hit."""
+    reason = API_LIMIT_CODE_MESSAGES.get(err.code, "access limit exceeded")
+    _LOGGER.error(
+        "APsystems API limit exceeded (code %s: %s) on %s. Pausing API calls "
+        "until the limit resets. Increase the scan interval in the integration "
+        "options to stay under the 1000 calls/month quota.",
+        err.code, reason, err.path,
+    )
+    persistent_notification.async_create(
+        hass,
+        title="APsystems: API limit exceeded",
+        message=(
+            f"The APsystems OpenAPI reported **{reason}** (code {err.code}).\n\n"
+            "Data updates are paused until the limit resets. To avoid hitting "
+            "the 1000 calls/month quota, increase the **scan interval** via "
+            "Settings → Devices & Services → APsystems OpenAPI → Configure."
+        ),
+        notification_id=f"{DOMAIN}_api_limit",
+    )
+
+
+def _clear_api_limit_notification(hass: HomeAssistant) -> None:
+    """Dismiss the API-limit notification after a successful API call."""
+    persistent_notification.async_dismiss(hass, f"{DOMAIN}_api_limit")
+
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     data = entry.data  # <— fix
@@ -101,6 +139,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 return parsed
             else:
                 _LOGGER.warning("Inverter list API error: %s", inv_resp)
+        except APSRateLimitError as exc:
+            _notify_api_limit(hass, exc)
         except Exception as exc:
             _LOGGER.warning("Error fetching inverter list: %s", exc)
         if inverter_cache["list"] is None:
@@ -121,6 +161,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     _LOGGER.debug("No energy data yet for inverter %s (code 1001)", uid)
                 else:
                     _LOGGER.warning("Inverter energy error for %s: %s", uid, resp)
+            except APSRateLimitError as exc:
+                _notify_api_limit(hass, exc)
+                break  # limit hit — stop hammering the API for remaining inverters
             except Exception as exc:
                 _LOGGER.warning("Failed to fetch energy for inverter %s: %s", uid, exc)
         inverter_cache["energy"] = inv_energy
@@ -145,6 +188,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     batch_data[eid] = resp.get("data", {})
                 else:
                     _LOGGER.warning("Batch power error for ECU %s: %s", eid, resp)
+            except APSRateLimitError as exc:
+                _notify_api_limit(hass, exc)
+                break  # limit hit — stop hammering the API for remaining ECUs
             except Exception as exc:
                 _LOGGER.warning("Failed to fetch batch power for ECU %s: %s", eid, exc)
         batch_power_cache["data"] = batch_data
@@ -194,6 +240,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             # ── Solar-hours: fetch hourly (every cycle) ──
             date_str = as_local(now()).date().isoformat()
             hourly = await client.get_system_energy_hourly(date_str)
+            # A successful call means we're under the limit again — clear any notice
+            _clear_api_limit_notification(hass)
             if hourly.get("code") != 0:
                 _LOGGER.warning("APsystems hourly error: %s", hourly)
                 hourly = {"code": 0, "data": []}
@@ -234,6 +282,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
             last_data.update(result)
             return result
+        except APSRateLimitError as e:
+            _notify_api_limit(hass, e)
+            # Serve cached data so entities stay available instead of going
+            # unavailable, which would hide the real cause from the user.
+            if last_data["summary"]:
+                cached = dict(last_data)
+                cached["solar_active"] = solar_active.get("is_active", False)
+                cached.setdefault("inverters", inverter_cache["list"] or [])
+                cached.setdefault("inverter_energy", inverter_cache["energy"])
+                cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
+                cached.setdefault("batch_power", batch_power_cache["data"])
+                cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
+                return cached
+            raise UpdateFailed(str(e)) from e
         except Exception as e:
             raise UpdateFailed(str(e)) from e
 
@@ -248,6 +310,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
 
     await coordinator.async_config_entry_first_refresh()
+
+    # ── Auto scan-interval ──────────────────────────────────────────────────
+    # Once inverters are discovered, size the polling interval to the site's
+    # longest day (from HA's configured latitude) and the inverter/ECU count so
+    # the busiest month stays under the 1000 calls/month quota.
+    if data.get("auto_scan_interval", True):
+        inverters = inverter_cache["list"] or []
+        num_inverters = len(inverters)
+        num_ecus = len({inv.get("eid") for inv in inverters if inv.get("eid")}) or 1
+        latitude = hass.config.latitude
+        if num_inverters and latitude is not None:
+            recommended = recommended_scan_interval(latitude, num_inverters, num_ecus)
+            est = estimate_monthly_calls(recommended, latitude, num_inverters, num_ecus)
+            _LOGGER.info(
+                "Auto scan-interval: %ds (%.0f min) for %d inverter(s)/%d ECU(s) "
+                "at lat %.2f — est. %d calls/month (quota %d)",
+                recommended, recommended / 60, num_inverters, num_ecus,
+                latitude, est, MONTHLY_API_QUOTA,
+            )
+            scan_interval = recommended
+            coordinator.update_interval = timedelta(seconds=recommended)
+        else:
+            _LOGGER.debug(
+                "Auto scan-interval skipped (inverters=%d, latitude=%s); "
+                "using configured %ds",
+                num_inverters, latitude, scan_interval,
+            )
 
     # Set up sunrise/sunset event listeners to trigger updates
     async def handle_sun_event(event):
