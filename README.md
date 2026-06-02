@@ -21,6 +21,7 @@ A quick note: I was originally using a modified version of a similar tool but it
 - **Tolerant JSON parsing** — accepts valid JSON even when the API returns an unexpected content-type (e.g. `application/octet-stream`)
 - **Automatic stale-inverter cleanup** — inverters no longer reported by the API are removed from the device registry, and can also be removed manually from the UI
 - Manual refresh buttons for the inverter list and inverter energy data
+- Ships its own **brand icon** (via a local `brand/` folder, Home Assistant 2026.3+) so the integration logo shows in the UI without a brands-repo submission
 - Uses **Home Assistant Config Flow** with an options flow (no YAML required)
 - Includes debug logging for easy troubleshooting
 
@@ -47,6 +48,9 @@ config/
 			const.py
 			manifest.json
 			sensor.py
+			brand/
+				icon.png
+				icon@2x.png
 			translations/
 				en.json
 ```
