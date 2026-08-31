@@ -92,6 +92,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "fetched_date": None,   # date string of last fetch
     }
 
+    # Storage (battery) tracking state. Fetched once per day just after
+    # midnight for the *previous* day, so the overnight discharge is included.
+    storage_cache = {
+        "eid": None,            # storage-activated ECU (the PCS serial)
+        "latest": None,         # /storage/latest payload
+        "period": None,         # /storage/period payload for the previous day
+        "fetched_date": None,   # date the period data covers
+    }
+    
     def update_solar_state():
         """Check if we're currently in solar hours (30 min after sunrise to sunset)."""
         from homeassistant.util.dt import now as dt_now
@@ -128,6 +137,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 parsed = []
                 for ecu in (raw if isinstance(raw, list) else []):
                     eid = ecu.get("eid")
+                    if ecu.get("type") == 2:      # 2 = ECU with storage activated
+                        storage_cache["eid"] = eid
                     for inv in ecu.get("inverter", []):
                         parsed.append({
                             "eid": eid,
@@ -204,6 +215,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             coordinator.async_set_updated_data(coordinator.data)
         return batch_data
 
+    async def refresh_storage():
+        """Fetch battery state and the previous day's full energy balance.
+
+        Two calls. Runs just after midnight so the previous day is complete,
+        including the overnight discharge a pre-midnight fetch would miss.
+        """
+        eid = storage_cache["eid"]
+        if not eid:
+            _LOGGER.debug("No storage-activated ECU found; skipping storage fetch")
+            return None
+        yesterday = (as_local(now()).date() - timedelta(days=1)).isoformat()
+        try:
+            latest = await client.get_storage_latest(eid)
+            if isinstance(latest, dict) and latest.get("code") == 0:
+                storage_cache["latest"] = latest.get("data", {})
+            else:
+                _LOGGER.warning("Storage latest error: %s", latest)
+
+            period = await client.get_storage_period(eid, yesterday, energy_level="minutely")
+            if isinstance(period, dict) and period.get("code") == 0:
+                storage_cache["period"] = period.get("data", {})
+                storage_cache["fetched_date"] = yesterday
+                _LOGGER.info("Storage data fetched for %s", yesterday)
+            elif isinstance(period, dict) and period.get("code") == 1001:
+                _LOGGER.debug("No storage data yet for %s (code 1001)", yesterday)
+            else:
+                _LOGGER.warning("Storage period error: %s", period)
+        except APSRateLimitError as exc:
+            _notify_api_limit(hass, exc)
+        except Exception as exc:
+            _LOGGER.warning("Error fetching storage data: %s", exc)
+
+        if coordinator.data is not None:
+            coordinator.data["storage_latest"] = storage_cache["latest"]
+            coordinator.data["storage_period"] = storage_cache["period"]
+            coordinator.data["storage_date"] = storage_cache["fetched_date"]
+            coordinator.async_set_updated_data(coordinator.data)
+        return storage_cache["latest"]
+    
     async def _async_update():
         """Fetch data from API only during solar hours."""
         try:
@@ -225,6 +275,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
                     cached.setdefault("batch_power", batch_power_cache["data"])
                     cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
+                    cached.setdefault("storage_latest", storage_cache["latest"])
+                    cached.setdefault("storage_period", storage_cache["period"])
+                    cached.setdefault("storage_date", storage_cache["fetched_date"])
+                    
                     return cached
                 return {
                     "summary": None,
@@ -236,6 +290,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     "inverter_energy_date": inverter_cache["energy_date"],
                     "batch_power": batch_power_cache["data"],
                     "batch_power_date": batch_power_cache["fetched_date"],
+                    "storage_latest": storage_cache["latest"],
+                    "storage_period": storage_cache["period"],
+                    "storage_date": storage_cache["fetched_date"],
                 }
 
             # ── Solar-hours: fetch hourly (every cycle) ──
@@ -280,6 +337,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             result["inverter_energy_date"] = inverter_cache["energy_date"]
             result["batch_power"] = batch_power_cache["data"]
             result["batch_power_date"] = batch_power_cache["fetched_date"]
+            result["storage_latest"] = storage_cache["latest"]
+            result["storage_period"] = storage_cache["period"]
+            result["storage_date"] = storage_cache["fetched_date"]
 
             last_data.update(result)
             return result
@@ -295,6 +355,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
                 cached.setdefault("batch_power", batch_power_cache["data"])
                 cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
+                cached.setdefault("storage_latest", storage_cache["latest"])
+                cached.setdefault("storage_period", storage_cache["period"])
+                cached.setdefault("storage_date", storage_cache["fetched_date"])
                 return cached
             raise UpdateFailed(str(e)) from e
         except Exception as e:
@@ -408,6 +471,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         async_track_point_in_utc_time(hass, _run_batch, target)
         _LOGGER.info("Scheduled batch power fetch at %s", target)
 
+    # Schedule storage fetch at 00:30 daily — the previous day is then complete,
+    # including overnight battery discharge.
+    async def schedule_storage(now_time):
+        local_now = as_local(now())
+        target = local_now.replace(hour=0, minute=30, second=0, microsecond=0)
+        if local_now >= target:
+            target += timedelta(days=1)
+        async def _run_storage(event):
+            await refresh_storage()
+            await schedule_storage(now())
+        async_track_point_in_utc_time(hass, _run_storage, target)
+        _LOGGER.info("Scheduled storage fetch at %s", target)
+
     # Schedule midnight coordinator refresh to reset daily sensors
     async def schedule_midnight_refresh(now_time):
         """Schedule a coordinator refresh at midnight to reset daily sensors."""
@@ -425,7 +501,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     await schedule_sunset_update(now())
     await schedule_batch_power(now())
     await schedule_midnight_refresh(now())
-
+    await schedule_storage(now())
     # Store everything needed for sensors and button
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "client": client,
