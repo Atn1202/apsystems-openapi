@@ -119,3 +119,43 @@ class APSClient:
             f"/user/api/v2/systems/{self.sid}/devices/inverter/batch/energy/{eid}",
             params={"energy_level": "power", "date_range": date_str},
         )
+    async def get_storage_eid(self):
+        """Return the eid of the storage-activated ECU (type == 2), or None.
+
+        Storage endpoints key off the ECU that has storage activated, which is
+        the PCS serial (e.g. B05000000208), not the PV ECU id.
+        """
+        data = await self.get_inverters()
+        for dev in (data or {}).get("data") or []:
+            if dev.get("type") == 2:
+                return dev.get("eid")
+        return None
+
+    async def get_storage_latest(self, eid: str):
+        """Get latest storage state: mode, soc, charge/discharge power, and the
+        instantaneous produced/consumed/imported/exported values."""
+        return await self._get(
+            f"/user/api/v2/systems/{self.sid}/devices/storage/latest/{eid}"
+        )
+
+    async def get_storage_summary(self, eid: str):
+        """Get cumulative storage energy at today/month/year/lifetime."""
+        return await self._get(
+            f"/user/api/v2/systems/{self.sid}/devices/storage/summary/{eid}"
+        )
+
+    async def get_storage_period(self, eid: str, date_str: str, energy_level: str = "minutely"):
+        """Get storage energy/power over a period.
+
+        energy_level: "minutely" | "hourly" | "daily" | "monthly" | "yearly".
+        With "minutely" this returns the whole day's battery and house balance
+        (discharge/charge/produced/consumed/exported/imported) in ONE call.
+
+        NOTE: the returned time list is NOT a fixed-length grid — a real day
+        returned 223 points, not 288. Index by the `time` list, never by
+        position.
+        """
+        return await self._get(
+            f"/user/api/v2/systems/{self.sid}/devices/storage/period/{eid}",
+            params={"energy_level": energy_level, "date_range": date_str},
+        )
