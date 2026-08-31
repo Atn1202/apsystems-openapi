@@ -374,10 +374,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
 
     await coordinator.async_config_entry_first_refresh()
-    # Fetch storage once at startup so battery sensors populate immediately
-    # rather than waiting for the 00:30 schedule.
-    if storage_cache["eid"]:
-        await refresh_storage()
+
 
     # ── Auto scan-interval ──────────────────────────────────────────────────
     # Once inverters are discovered, size the polling interval to the site's
