@@ -14,6 +14,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     async_add_entities([
         APSRefreshInvertersButton(hass, entry),
         APSRefreshInverterEnergyButton(hass, entry),
+        APSRefreshStorageButton(hass, entry),
     ])
 
 
@@ -78,5 +79,44 @@ class APSRefreshInverterEnergyButton(ButtonEntity):
         _LOGGER.info("Manual inverter energy refresh triggered")
         energy = await refresh_fn()
         _LOGGER.info("Inverter energy refresh complete: %d inverter(s)", len(energy))
+
+        await coordinator.async_request_refresh()
+
+class APSRefreshStorageButton(ButtonEntity):
+    """Button to manually fetch battery state and the previous day's balance.
+
+    Storage data is otherwise fetched once daily at 00:30. This button exists
+    so the data can be pulled on demand without waiting — and so no fetch
+    happens automatically on startup, which would cost 2 API calls per restart.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Refresh Storage Data"
+    _attr_icon = "mdi:battery-sync"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
+        self._entry = entry
+        self._sid = entry.data["sid"]
+        self._attr_unique_id = f"{self._sid}_refresh_storage"
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._sid)},
+            "manufacturer": "APsystems",
+            "name": f"APsystems {self._sid}",
+        }
+
+    async def async_press(self) -> None:
+        store = self.hass.data[DOMAIN][self._entry.entry_id]
+        refresh_fn = store["refresh_storage"]
+        coordinator = store["coordinator"]
+
+        _LOGGER.info("Manual storage refresh triggered")
+        latest = await refresh_fn()
+        if latest:
+            _LOGGER.info("Storage refresh complete: SoC %s%%", latest.get("soc"))
+        else:
+            _LOGGER.info("Storage refresh returned no data (no storage ECU?)")
 
         await coordinator.async_request_refresh()
