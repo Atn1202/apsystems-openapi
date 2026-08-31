@@ -413,7 +413,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         if not inverters:
             return
         sid = data["sid"]
+        # Include the storage device: it is not an inverter, so without this
+        # the pruner treats it as stale and deletes it on every update.
         live_ids = {sid} | {inv["uid"] for inv in inverters if inv.get("uid")}
+        if storage_cache.get("eid"):
+            live_ids.add(f"{sid}_storage")
         device_reg = dr.async_get(hass)
         for device in dr.async_entries_for_config_entry(device_reg, entry.entry_id):
             device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
