@@ -295,6 +295,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     "storage_date": storage_cache["fetched_date"],
                 }
 
+            # ── PV polling disabled: return cached shape without API calls ──
+            if not poll_pv:
+                _LOGGER.debug("PV polling disabled; skipping cloud inverter fetches")
+                result = dict(last_data)
+                result["solar_active"] = True
+                result["date"] = as_local(now()).date().isoformat()
+                result.setdefault("summary", None)
+                result.setdefault("hourly", None)
+                result["inverters"] = inverter_cache["list"] or []
+                result["inverter_energy"] = inverter_cache["energy"]
+                result["inverter_energy_date"] = inverter_cache["energy_date"]
+                result["batch_power"] = batch_power_cache["data"]
+                result["batch_power_date"] = batch_power_cache["fetched_date"]
+                result["storage_latest"] = storage_cache["latest"]
+                result["storage_period"] = storage_cache["period"]
+                result["storage_date"] = storage_cache["fetched_date"]
+                return result
             # ── Solar-hours: fetch hourly (every cycle) ──
             date_str = as_local(now()).date().isoformat()
             hourly = await client.get_system_energy_hourly(date_str)
@@ -329,7 +346,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             # ── Inverter energy: fetch once per day at 12:30 ──
             current_time = as_local(now())
             past_1230 = current_time.hour > 12 or (current_time.hour == 12 and current_time.minute >= 30)
-            if past_1230 and inverter_cache["energy_date"] != date_str:
+            if poll_pv and past_1230 and inverter_cache["energy_date"] != date_str:
                 await refresh_inverter_energy()
 
             result["inverters"] = inverter_cache["list"] or []
@@ -365,6 +382,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     # Default 30-minute interval (~960 API calls/month with 6 inverters)
     scan_interval = int(data.get("scan_interval", 1800))  # Default 30 minutes
+    # When False, skip all cloud PV polling. Useful when inverter data is already
+    # available locally (e.g. via a local ECU integration): the storage endpoints
+    # are then the only reason to call the API, cutting usage from ~800 to ~60
+    # calls/month.
+    poll_pv = data.get("poll_pv", True)
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -472,6 +494,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         async def _run_batch(event):
             await refresh_batch_power()
             # Re-schedule for the next day
+        if poll_pv:
             await schedule_batch_power(now())
         async_track_point_in_utc_time(hass, _run_batch, target)
         _LOGGER.info("Scheduled batch power fetch at %s", target)
