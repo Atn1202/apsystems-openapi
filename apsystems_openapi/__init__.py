@@ -511,6 +511,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "refresh_inverter_energy": refresh_inverter_energy,
         "refresh_batch_power": refresh_batch_power,
         "refresh_storage": refresh_storage,
+        "storage_cache": storage_cache,
         "sun_handlers": {
             "sunrise": schedule_sunrise_update,
             "sunset": schedule_sunset_update
