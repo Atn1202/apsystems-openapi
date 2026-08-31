@@ -47,7 +47,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(APSInverterTemperatureSensor(coordinator, sid, inv))
 
     # Storage (battery) sensors — only when the system has a storage ECU.
-    if coordinator.data.get("storage_latest") is not None:
+    # Create battery sensors whenever the system has a storage ECU. Guarding on
+    # fetched data instead would never fire: the cache is rebuilt empty on every
+    # setup, so data fetched before a reload is gone by the time this runs.
+    if store.get("storage_cache", {}).get("eid"):
         entities.append(APSStorageSoCSensor(coordinator, sid))
         entities.append(APSStorageModeSensor(coordinator, sid))
         for suffix, name, field in (
