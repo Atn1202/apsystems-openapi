@@ -11,6 +11,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema({
     vol.Required("app_id"): str,
     vol.Required("app_secret"): str,
     vol.Required("sid", description="System ID as shown in EMA"): str,
+    vol.Optional("poll_pv", default=True): bool,  # cloud PV polling; disable if you read the ECU locally
     vol.Optional("base_url", default=DEFAULT_BASE_URL): str,
     vol.Optional("auto_scan_interval", default=True): bool,  # auto-size to stay under quota
     vol.Optional("scan_interval", default=1800): vol.All(int, vol.Range(min=1800, max=7200)),  # 30 min to 2 hours
@@ -70,6 +71,7 @@ class APSOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("auto_scan_interval", default=current.get("auto_scan_interval", True)): bool,
             vol.Optional("scan_interval", default=current.get("scan_interval", 1800)): vol.All(
                 int, vol.Range(min=1800, max=7200)
+            vol.Optional("poll_pv", default=current.get("poll_pv", True)): bool,
             ),
 
         })
