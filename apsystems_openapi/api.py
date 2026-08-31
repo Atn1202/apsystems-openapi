@@ -119,17 +119,6 @@ class APSClient:
             f"/user/api/v2/systems/{self.sid}/devices/inverter/batch/energy/{eid}",
             params={"energy_level": "power", "date_range": date_str},
         )
-    async def get_storage_eid(self):
-        """Return the eid of the storage-activated ECU (type == 2), or None.
-
-        Storage endpoints key off the ECU that has storage activated, which is
-        the PCS serial (e.g. B05000000208), not the PV ECU id.
-        """
-        data = await self.get_inverters()
-        for dev in (data or {}).get("data") or []:
-            if dev.get("type") == 2:
-                return dev.get("eid")
-        return None
 
     async def get_storage_latest(self, eid: str):
         """Get latest storage state: mode, soc, charge/discharge power, and the
