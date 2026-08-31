@@ -97,5 +97,66 @@ async def main():
             print("-----")
             print(f"Hourly ERROR (HTTP {status}) for {args.date}: {payload}")
 
+        # ---- Storage (battery) ----
+        # Requires a storage-activated ECU (type 2 in the device list). Systems
+        # without a battery will report "no storage ECU" and skip these checks.
+        inv_path = f"/user/api/v2/systems/inverters/{args.sid}"
+        inv_headers = build_headers(args.app_id, args.app_secret, inv_path, "GET")
+        status, payload = await get_json(session, args.base_url + inv_path, inv_headers)
+
+        storage_eid = None
+        if isinstance(payload, dict) and payload.get("code") == 0:
+            for ecu in payload.get("data") or []:
+                if ecu.get("type") == 2:
+                    storage_eid = ecu.get("eid")
+        print("-----")
+        if not storage_eid:
+            print("No storage ECU found (PV-only system) — skipping storage tests")
+        else:
+            print(f"Storage ECU found: {storage_eid}")
+
+            # ---- Storage latest (SoC + mode) ----
+            lat_path = f"/user/api/v2/systems/{args.sid}/devices/storage/latest/{storage_eid}"
+            lat_headers = build_headers(args.app_id, args.app_secret, lat_path, "GET")
+            status, payload = await get_json(session, args.base_url + lat_path, lat_headers)
+
+            if isinstance(payload, dict) and payload.get("code") == 0:
+                d = payload.get("data", {})
+                print("Storage latest OK (code:0)")
+                print(f"   SoC:       {d.get('soc')} %")
+                print(f"   Mode:      {d.get('mode')}  (1 = Self-Consumption)")
+                print(f"   Charge:    {d.get('charge')} W")
+                print(f"   Discharge: {d.get('discharge')} W")
+                print(f"   Reading:   {d.get('time')}")
+            else:
+                print(f"Storage latest ERROR (HTTP {status}): {payload}")
+
+            # ---- Storage period (full-day energy balance) ----
+            per_path = f"/user/api/v2/systems/{args.sid}/devices/storage/period/{storage_eid}"
+            per_headers = build_headers(args.app_id, args.app_secret, per_path, "GET")
+            params = {"energy_level": "minutely", "date_range": args.date}
+            status, payload = await get_json(session, args.base_url + per_path, per_headers, params=params)
+
+            print("-----")
+            if isinstance(payload, dict) and payload.get("code") == 0:
+                data = payload.get("data") or {}
+                t = data.get("time") or []
+                tot = data.get("today") or {}
+                print(f"Storage period OK (code:0) for {args.date}")
+                print(f"   Points: {len(t)}  First: {t[:2]}  Last: {t[-2:]}")
+                for k in ("produced", "consumed", "imported", "exported", "charge", "discharge"):
+                    print(f"   {k.capitalize():<10} {tot.get(k)} kWh")
+                try:
+                    residual = (
+                        float(tot["produced"]) + float(tot["imported"]) + float(tot["discharge"])
+                        - float(tot["consumed"]) - float(tot["exported"]) - float(tot["charge"])
+                    )
+                    print(f"   Balance residual: {residual:+.3f} kWh"
+                          + ("  <-- should be ~0" if abs(residual) > 0.05 else "  (balances)"))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            else:
+                print(f"Storage period ERROR (HTTP {status}) for {args.date}: {payload}")
+
 if __name__ == "__main__":
     asyncio.run(main())
