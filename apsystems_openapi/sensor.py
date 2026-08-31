@@ -45,7 +45,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(APSInverterACVoltageSensor(coordinator, sid, inv))
         entities.append(APSInverterFrequencySensor(coordinator, sid, inv))
         entities.append(APSInverterTemperatureSensor(coordinator, sid, inv))
-            
+
     # Storage (battery) sensors — only when the system has a storage ECU.
     if coordinator.data.get("storage_latest") is not None:
         entities.append(APSStorageSoCSensor(coordinator, sid))
@@ -441,7 +441,7 @@ class APSInverterTemperatureSensor(_APSInverterFieldSensor):
 
 # Only mode "1" is confirmed against the EMA UI; the others are inferred from
 # the order of the mode dropdown (Backup / Self-Consumption / Advanced /
-# Peak-Shaving). The API manual documents no mapping at all. THIS NEEDS TO BE FURTHER VALIDATED but works for mode 1
+# Peak-Shaving). The API manual documents no mapping at all. 
 STORAGE_MODES = {
     "0": "Backup power supply",
     "1": "Self-Consumption",
