@@ -1,6 +1,6 @@
 # APsystems OpenAPI – Home Assistant Custom Integration
 
-# FORKED FROM https://github.com/n0liver/HAAC to add storage endpoints data, who in turned forked from https://blackhole.nmrc.org/solar/apsystems-openapi
+# FORKED FROM https://github.com/n0liver/HAAC to add storage endpoints data, who in turned forked from https://blackhole.nmrc.org/solar/apsystems-openapi . All edits are vibe-coded. I have am playing apprentice sorcerer. But I can confirm this works for me on my system. 
 
 This is a custom [Home Assistant](https://www.home-assistant.io/) integration for pulling **lifetime** and **daily** solar production data from the [APsystems OpenAPI](https://file.apsystemsema.com:8083/apsystems/resource/openapi/Apsystems_OpenAPI_User_Manual_End_User_EN.pdf). It is designed to integrate with the **Energy dashboard** and also provide today's production plus hourly production breakdowns and per-inverter telemetry, pulling data into Home Assistant from your APsystems account on their [Energy Monitoring & Analysis (EMA) System](https://www.apsystemsema.com/ema/index.action).
 
