@@ -45,6 +45,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         entities.append(APSInverterACVoltageSensor(coordinator, sid, inv))
         entities.append(APSInverterFrequencySensor(coordinator, sid, inv))
         entities.append(APSInverterTemperatureSensor(coordinator, sid, inv))
+            
+    # Storage (battery) sensors — only when the system has a storage ECU.
+    if coordinator.data.get("storage_latest") is not None:
+        entities.append(APSStorageSoCSensor(coordinator, sid))
+        entities.append(APSStorageModeSensor(coordinator, sid))
+        for suffix, name, field in (
+            ("charged", "Charged", "charge"),
+            ("discharged", "Discharged", "discharge"),
+            ("produced", "Solar Produced", "produced"),
+            ("consumed", "House Consumed", "consumed"),
+            ("imported", "Grid Imported", "imported"),
+            ("exported", "Grid Exported", "exported"),
+        ):
+            entities.append(APSStorageDailyEnergySensor(coordinator, sid, suffix, name, field))
 
     async_add_entities(entities)
 
@@ -420,3 +434,135 @@ class APSInverterTemperatureSensor(_APSInverterFieldSensor):
 
     def __init__(self, coordinator, sid, inv):
         super().__init__(coordinator, sid, inv, "temperature", "Temperature")
+
+# ---------------------------------------------------------------------------
+# Storage (battery) sensors
+# ---------------------------------------------------------------------------
+
+# Only mode "1" is confirmed against the EMA UI; the others are inferred from
+# the order of the mode dropdown (Backup / Self-Consumption / Advanced /
+# Peak-Shaving). The API manual documents no mapping at all. THIS NEEDS TO BE FURTHER VALIDATED but works for mode 1
+STORAGE_MODES = {
+    "0": "Backup power supply",
+    "1": "Self-Consumption",
+    "2": "Advanced",
+    "3": "Peak-Shaving",
+}
+
+
+class _APSStorageEntity(APSBaseEntity):
+    """Base for battery sensors. Groups them under their own device."""
+
+    def __init__(self, coordinator, sid: str, suffix: str, name: str):
+        super().__init__(coordinator, sid, f"storage_{suffix}")
+        self._attr_name = name
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, f"{self._sid}_storage")},
+            "manufacturer": "APsystems",
+            "name": "Battery",
+            "model": "Storage",
+            "via_device": (DOMAIN, self._sid),
+        }
+
+
+class APSStorageSoCSensor(_APSStorageEntity):
+    """Battery state of charge at the time of the last fetch.
+
+    NOT live: the storage endpoints are polled once daily, so this is a point
+    reading. The `reading_time` attribute carries the API's own timestamp.
+    """
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, coordinator, sid: str):
+        super().__init__(coordinator, sid, "soc", "State of Charge")
+
+    @property
+    def native_value(self) -> StateType:
+        latest = self.coordinator.data.get("storage_latest") or {}
+        return _safe_float(latest.get("soc"))
+
+    @property
+    def extra_state_attributes(self):
+        latest = self.coordinator.data.get("storage_latest") or {}
+        return {
+            "reading_time": latest.get("time"),
+            "charge_w": _safe_float(latest.get("charge")),
+            "discharge_w": _safe_float(latest.get("discharge")),
+            "source": "APsystems OpenAPI (storage/latest)",
+        }
+
+
+class APSStorageModeSensor(_APSStorageEntity):
+    """Battery working mode, decoded from the undocumented numeric field."""
+
+    def __init__(self, coordinator, sid: str):
+        super().__init__(coordinator, sid, "mode", "Mode")
+
+    @property
+    def native_value(self) -> StateType:
+        latest = self.coordinator.data.get("storage_latest") or {}
+        raw = latest.get("mode")
+        if raw is None:
+            return None
+        return STORAGE_MODES.get(str(raw), f"Unknown ({raw})")
+
+    @property
+    def extra_state_attributes(self):
+        latest = self.coordinator.data.get("storage_latest") or {}
+        raw = str(latest.get("mode", ""))
+        return {
+            "raw_mode": raw,
+            # Only "1" has been verified against the EMA web UI.
+            "mapping_confirmed": raw == "1",
+        }
+
+
+class APSStorageDailyEnergySensor(_APSStorageEntity):
+    """One term of the previous day's energy balance, in kWh.
+
+    The six terms satisfy:
+        produced + imported + discharge == consumed + exported + charge
+
+    These describe a COMPLETED past day, so they are not suitable for the HA
+    Energy dashboard, which expects today's running totals.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator, sid: str, suffix: str, name: str, field: str):
+        super().__init__(coordinator, sid, suffix, f"{name} (yesterday)")
+        self._field = field
+
+    @property
+    def native_value(self) -> StateType:
+        period = self.coordinator.data.get("storage_period") or {}
+        # The API labels this block "today", but it is the requested date.
+        return _safe_float((period.get("today") or {}).get(self._field))
+
+    @property
+    def extra_state_attributes(self):
+        period = self.coordinator.data.get("storage_period") or {}
+        totals = period.get("today") or {}
+        attrs = {
+            "data_date": self.coordinator.data.get("storage_date"),
+            "source": "APsystems OpenAPI (storage/period)",
+        }
+        # Balance residual — a non-zero value means the six terms disagree and
+        # something is wrong with the fetch or the upstream data.
+        try:
+            residual = (
+                float(totals["produced"]) + float(totals["imported"]) + float(totals["discharge"])
+                - float(totals["consumed"]) - float(totals["exported"]) - float(totals["charge"])
+            )
+            attrs["balance_residual_kwh"] = round(residual, 3)
+        except (KeyError, TypeError, ValueError):
+            pass
+        return attrs
