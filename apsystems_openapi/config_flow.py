@@ -71,8 +71,7 @@ class APSOptionsFlow(config_entries.OptionsFlow):
             vol.Optional("auto_scan_interval", default=current.get("auto_scan_interval", True)): bool,
             vol.Optional("scan_interval", default=current.get("scan_interval", 1800)): vol.All(
                 int, vol.Range(min=1800, max=7200)
-            vol.Optional("poll_pv", default=current.get("poll_pv", True)): bool,
             ),
-
+            vol.Optional("poll_pv", default=current.get("poll_pv", True)): bool,
         })
         return self.async_show_form(step_id="init", data_schema=schema)
