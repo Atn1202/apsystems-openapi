@@ -486,7 +486,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # Schedule batch power fetch at 11 PM daily
     async def schedule_batch_power(now_time):
         """Schedule batch power fetch at 11 PM local time, re-scheduling for the next day."""
-        import datetime
         local_now = as_local(now())
         target = local_now.replace(hour=23, minute=0, second=0, microsecond=0)
         if local_now >= target:
@@ -494,7 +493,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         async def _run_batch(event):
             await refresh_batch_power()
             # Re-schedule for the next day
-        if poll_pv:
             await schedule_batch_power(now())
         async_track_point_in_utc_time(hass, _run_batch, target)
         _LOGGER.info("Scheduled batch power fetch at %s", target)
@@ -527,7 +525,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # Schedule the initial sun events
     await schedule_sunrise_update(now())
     await schedule_sunset_update(now())
-    await schedule_batch_power(now())
+    if poll_pv:
+        await schedule_batch_power(now())
     await schedule_midnight_refresh(now())
     await schedule_storage(now())
     # Store everything needed for sensors and button
