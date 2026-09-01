@@ -627,6 +627,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "refresh_batch_power": refresh_batch_power,
         "refresh_storage": refresh_storage,
         "storage_cache": storage_cache,
+        # Platforms read this to decide whether cloud-PV-only entities are
+        # worth creating at all.
+        "poll_pv": poll_pv,
         "sun_handlers": {
             "sunrise": schedule_sunrise_update,
             "sunset": schedule_sunset_update
