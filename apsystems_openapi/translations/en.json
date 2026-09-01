@@ -34,14 +34,28 @@
     "step": {
       "init": {
         "title": "APsystems OpenAPI options",
-        "description": "Adjust how often the integration polls the APsystems API.",
+        "description": "Adjust how often the integration polls the APsystems API. The free OpenAPI quota is 1000 calls per month; the estimated usage for your current settings is written to the Home Assistant log each time the integration starts.",
         "data": {
+          "poll_pv": "Poll PV production data from the cloud",
           "auto_scan_interval": "Automatically optimise polling interval",
           "scan_interval": "Polling interval (seconds)"
         },
         "data_description": {
+          "poll_pv": "Controls whether solar production is fetched from the APsystems cloud. Turn it OFF when the same data already reaches Home Assistant over your local network — for example from an ECU integration polling the ECU directly — since the cloud copy is then redundant and merely slower. With it off, the API is used only for battery data: roughly 60 calls per month instead of 810, and the polling interval below stops mattering. Turn it ON only if the cloud is your sole source of production data; while it is off the production and per-inverter sensors stay empty.",
           "auto_scan_interval": "When enabled, the polling interval is sized automatically to stay within the API quota. Disable to use the fixed interval below.",
-          "scan_interval": "Seconds between API calls during solar hours (1800–7200, default 1800 = 30 min). Ignored when automatic optimisation is enabled."
+          "scan_interval": "Seconds between API calls during solar hours (1800–7200, default 1800 = 30 min). Ignored when automatic optimisation is enabled, and unused entirely when cloud PV polling is off."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "storage_mode": {
+        "state": {
+          "backup_power_supply": "Backup power supply",
+          "self_consumption": "Self-consumption",
+          "advanced": "Advanced",
+          "peak_shaving": "Peak-shaving"
         }
       }
     }
