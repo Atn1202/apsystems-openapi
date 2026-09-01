@@ -1,8 +1,11 @@
 from __future__ import annotations
-from datetime import date as dt_date, datetime as dt_datetime
+
+from datetime import datetime as dt_datetime
+
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.components.sensor.const import SensorStateClass
 from homeassistant.const import (
+    PERCENTAGE,
     UnitOfEnergy,
     UnitOfPower,
     UnitOfElectricPotential,
@@ -17,11 +20,30 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.typing import StateType
 from homeassistant.util.dt import now as dt_now
+
 import logging
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _safe_dict(v) -> dict:
+    """Return v when it is a dict, otherwise an empty dict.
+
+    The API returns null for absent blocks, so ``.get(key, {})`` is not enough:
+    the {} default only applies when the key is *missing*, not when it is
+    present with a null value.
+    """
+    return v if isinstance(v, dict) else {}
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     store = hass.data[DOMAIN][entry.entry_id]
@@ -34,7 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     ]
 
     # Create per-inverter sensors from discovered inverter list
-    for inv in coordinator.data.get("inverters", []):
+    for inv in _safe_dict(coordinator.data).get("inverters") or []:
         entities.append(APSInverterPowerSensor(coordinator, sid, inv))
         entities.append(APSInverterDCPowerCh1Sensor(coordinator, sid, inv))
         entities.append(APSInverterDCPowerCh2Sensor(coordinator, sid, inv))
@@ -50,7 +72,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # Create battery sensors whenever the system has a storage ECU. Guarding on
     # fetched data instead would never fire: the cache is rebuilt empty on every
     # setup, so data fetched before a reload is gone by the time this runs.
-    if store.get("storage_cache", {}).get("eid"):
+    if _safe_dict(store.get("storage_cache")).get("eid"):
         entities.append(APSStorageSoCSensor(coordinator, sid))
         entities.append(APSStorageModeSensor(coordinator, sid))
         for suffix, name, field in (
@@ -65,6 +87,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     async_add_entities(entities)
 
+
 class APSBaseEntity(CoordinatorEntity, SensorEntity):
     _attr_has_entity_name = True
 
@@ -74,6 +97,17 @@ class APSBaseEntity(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = f"{sid}_{name_suffix}"
 
     @property
+    def _data(self) -> dict:
+        """Coordinator payload, never None.
+
+        ``coordinator.data`` is None before the first successful fetch, and
+        this integration deliberately does not fetch at startup, so every
+        property is asked for a value while it is still None. Read through
+        this instead of touching ``self.coordinator.data`` directly.
+        """
+        return _safe_dict(self.coordinator.data)
+
+    @property
     def device_info(self):
         # Ensures a device tile appears in the UI
         return {
@@ -81,6 +115,7 @@ class APSBaseEntity(CoordinatorEntity, SensorEntity):
             "manufacturer": "APsystems",
             "name": f"APsystems {self._sid}",
         }
+
 
 class APSLifetimeEnergySensor(APSBaseEntity, RestoreEntity):
     """Monotonic lifetime kWh for Energy dashboard."""
@@ -107,11 +142,11 @@ class APSLifetimeEnergySensor(APSBaseEntity, RestoreEntity):
 
     @property
     def native_value(self) -> StateType:
-        summary = self.coordinator.data.get("summary", {})
-        if summary and summary.get("code") == 0:
-            data = summary.get("data", {})
+        summary = _safe_dict(self._data.get("summary"))
+        if summary.get("code") == 0:
+            payload = _safe_dict(summary.get("data"))
             try:
-                val = float(data.get("lifetime"))
+                val = float(payload.get("lifetime"))
                 if val > 0:
                     self._last_valid_value = val
                     return val
@@ -121,20 +156,21 @@ class APSLifetimeEnergySensor(APSBaseEntity, RestoreEntity):
 
     @property
     def extra_state_attributes(self):
-        summary = self.coordinator.data.get("summary", {}).get("data", {}) or {}
-        hourly = self.coordinator.data.get("hourly", {}) or {}
-        solar_active = self.coordinator.data.get("solar_active", True)
-
+        data = self._data
+        summary = _safe_dict(_safe_dict(data.get("summary")).get("data"))
+        hourly = _safe_dict(data.get("hourly"))
+        solar_active = data.get("solar_active", True)
         return {
             "today_kwh": _safe_float(summary.get("today")),
             "month_kwh": _safe_float(summary.get("month")),
             "year_kwh": _safe_float(summary.get("year")),
             "hourly_kwh": hourly.get("data"),
-            "hourly_date": self.coordinator.data.get("date"),
+            "hourly_date": data.get("date"),
             "source": "APsystems OpenAPI",
             "solar_hours_active": solar_active,
-            "status": "Solar hours" if solar_active else "Night hours (cached data)"
+            "status": "Solar hours" if solar_active else "Night hours (cached data)",
         }
+
 
 class APSTodayEnergySensor(APSBaseEntity, RestoreEntity):
     """Non-monotonic daily energy (kWh); resets each day at midnight."""
@@ -169,6 +205,7 @@ class APSTodayEnergySensor(APSBaseEntity, RestoreEntity):
     @property
     def native_value(self) -> StateType:
         today = dt_now().date().isoformat()
+        data = self._data
 
         # Reset at midnight when the real date moves past our cached date
         if self._last_date and self._last_date != today:
@@ -176,11 +213,10 @@ class APSTodayEnergySensor(APSBaseEntity, RestoreEntity):
             self._last_date = today
 
         # Only use coordinator data if it's from today
-        data_date = self.coordinator.data.get("date")
-        if data_date == today:
+        if data.get("date") == today:
             # Try to compute from hourly data
-            hourly = self.coordinator.data.get("hourly", {})
-            if hourly and hourly.get("code") == 0:
+            hourly = _safe_dict(data.get("hourly"))
+            if hourly.get("code") == 0:
                 series = hourly.get("data") or []
                 try:
                     total = round(sum(float(x) for x in series if x is not None), 3)
@@ -192,10 +228,10 @@ class APSTodayEnergySensor(APSBaseEntity, RestoreEntity):
                     pass
 
             # Fallback to summary "today" field
-            summary = self.coordinator.data.get("summary", {})
-            if summary and summary.get("code") == 0:
-                data = summary.get("data", {})
-                today_val = _safe_float(data.get("today"))
+            summary = _safe_dict(data.get("summary"))
+            if summary.get("code") == 0:
+                payload = _safe_dict(summary.get("data"))
+                today_val = _safe_float(payload.get("today"))
                 if today_val is not None and today_val > 0:
                     self._last_valid_value = today_val
                     self._last_date = today
@@ -208,27 +244,20 @@ class APSTodayEnergySensor(APSBaseEntity, RestoreEntity):
 
     @property
     def extra_state_attributes(self):
-        hourly = self.coordinator.data.get("hourly", {}) or {}
-        solar_active = self.coordinator.data.get("solar_active", True)
-
+        data = self._data
+        hourly = _safe_dict(data.get("hourly"))
+        solar_active = data.get("solar_active", True)
         return {
             "hourly_kwh": hourly.get("data"),
-            "hourly_date": self._last_date or self.coordinator.data.get("date"),
+            "hourly_date": self._last_date or data.get("date"),
             "solar_hours_active": solar_active,
-            "status": "Solar hours" if solar_active else "Night hours (cached data)"
+            "status": "Solar hours" if solar_active else "Night hours (cached data)",
         }
-
-def _safe_float(v):
-    try:
-        return float(v)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
 # Per-inverter power sensor
 # ---------------------------------------------------------------------------
-
 class APSInverterPowerSensor(APSBaseEntity):
     """AC output power of a single micro-inverter (latest reading)."""
 
@@ -254,6 +283,10 @@ class APSInverterPowerSensor(APSBaseEntity):
         }
 
     # -- helpers --
+    @property
+    def _energy(self) -> dict:
+        """This inverter's minutely series block, never None."""
+        return _safe_dict(_safe_dict(self._data.get("inverter_energy")).get(self._uid))
 
     @staticmethod
     def _latest(series):
@@ -277,21 +310,17 @@ class APSInverterPowerSensor(APSBaseEntity):
             return None
 
     # -- HA properties --
-
     @property
     def native_value(self) -> StateType:
-        energy = self.coordinator.data.get("inverter_energy", {}).get(self._uid, {})
-        return self._latest(energy.get("ac_p1"))
+        return self._latest(self._energy.get("ac_p1"))
 
     @property
     def extra_state_attributes(self):
-        energy = self.coordinator.data.get("inverter_energy", {}).get(self._uid, {})
-
-        dc_p1 = energy.get("dc_p1", [])
-        dc_p2 = energy.get("dc_p2", [])
-        ac_p = energy.get("ac_p1", [])
-        times = energy.get("t", [])
-
+        energy = self._energy
+        dc_p1 = energy.get("dc_p1") or []
+        dc_p2 = energy.get("dc_p2") or []
+        ac_p = energy.get("ac_p1") or []
+        times = energy.get("t") or []
         return {
             "inverter_uid": self._uid,
             "inverter_type": self._inv_type,
@@ -305,14 +334,13 @@ class APSInverterPowerSensor(APSBaseEntity):
             "hourly_dc_p1": dc_p1,
             "hourly_dc_p2": dc_p2,
             "hourly_times": times,
-            "data_date": self.coordinator.data.get("inverter_energy_date"),
+            "data_date": self._data.get("inverter_energy_date"),
         }
 
 
 # ---------------------------------------------------------------------------
 # Per-inverter base for single-field sensors
 # ---------------------------------------------------------------------------
-
 class _APSInverterFieldSensor(APSBaseEntity):
     """Base for inverter sensors that read a single minutely field."""
 
@@ -337,9 +365,9 @@ class _APSInverterFieldSensor(APSBaseEntity):
 
     @property
     def native_value(self) -> StateType:
-        energy = self.coordinator.data.get("inverter_energy", {}).get(self._uid, {})
-        series = energy.get(self._field_key, [])
-        for v in reversed(series or []):
+        energy = _safe_dict(_safe_dict(self._data.get("inverter_energy")).get(self._uid))
+        series = energy.get(self._field_key) or []
+        for v in reversed(series):
             try:
                 f = float(v)
                 if f == f:
@@ -438,13 +466,13 @@ class APSInverterTemperatureSensor(_APSInverterFieldSensor):
     def __init__(self, coordinator, sid, inv):
         super().__init__(coordinator, sid, inv, "temperature", "Temperature")
 
+
 # ---------------------------------------------------------------------------
 # Storage (battery) sensors
 # ---------------------------------------------------------------------------
-
 # Only mode "1" is confirmed against the EMA UI; the others are inferred from
 # the order of the mode dropdown (Backup / Self-Consumption / Advanced /
-# Peak-Shaving). The API manual documents no mapping at all. 
+# Peak-Shaving). The API manual documents no mapping at all.
 STORAGE_MODES = {
     "0": "Backup power supply",
     "1": "Self-Consumption",
@@ -480,19 +508,19 @@ class APSStorageSoCSensor(_APSStorageEntity):
 
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = "%"
+    _attr_native_unit_of_measurement = PERCENTAGE
 
     def __init__(self, coordinator, sid: str):
         super().__init__(coordinator, sid, "soc", "State of Charge")
 
     @property
     def native_value(self) -> StateType:
-        latest = self.coordinator.data.get("storage_latest") or {}
+        latest = _safe_dict(self._data.get("storage_latest"))
         return _safe_float(latest.get("soc"))
 
     @property
     def extra_state_attributes(self):
-        latest = self.coordinator.data.get("storage_latest") or {}
+        latest = _safe_dict(self._data.get("storage_latest"))
         return {
             "reading_time": latest.get("time"),
             "charge_w": _safe_float(latest.get("charge")),
@@ -509,7 +537,7 @@ class APSStorageModeSensor(_APSStorageEntity):
 
     @property
     def native_value(self) -> StateType:
-        latest = self.coordinator.data.get("storage_latest") or {}
+        latest = _safe_dict(self._data.get("storage_latest"))
         raw = latest.get("mode")
         if raw is None:
             return None
@@ -517,7 +545,7 @@ class APSStorageModeSensor(_APSStorageEntity):
 
     @property
     def extra_state_attributes(self):
-        latest = self.coordinator.data.get("storage_latest") or {}
+        latest = _safe_dict(self._data.get("storage_latest"))
         raw = str(latest.get("mode", ""))
         return {
             "raw_mode": raw,
@@ -537,7 +565,6 @@ class APSStorageDailyEnergySensor(_APSStorageEntity):
     """
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
 
     def __init__(self, coordinator, sid: str, suffix: str, name: str, field: str):
@@ -546,16 +573,16 @@ class APSStorageDailyEnergySensor(_APSStorageEntity):
 
     @property
     def native_value(self) -> StateType:
-        period = self.coordinator.data.get("storage_period") or {}
+        period = _safe_dict(self._data.get("storage_period"))
         # The API labels this block "today", but it is the requested date.
-        return _safe_float((period.get("today") or {}).get(self._field))
+        return _safe_float(_safe_dict(period.get("today")).get(self._field))
 
     @property
     def extra_state_attributes(self):
-        period = self.coordinator.data.get("storage_period") or {}
-        totals = period.get("today") or {}
+        period = _safe_dict(self._data.get("storage_period"))
+        totals = _safe_dict(period.get("today"))
         attrs = {
-            "data_date": self.coordinator.data.get("storage_date"),
+            "data_date": self._data.get("storage_date"),
             "source": "APsystems OpenAPI (storage/period)",
         }
         # Balance residual — a non-zero value means the six terms disagree and
