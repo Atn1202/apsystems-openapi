@@ -1,122 +1,63 @@
-from __future__ import annotations
-import logging
-from homeassistant.components.button import ButtonEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-
-from .const import DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
-    async_add_entities([
-        APSRefreshInvertersButton(hass, entry),
-        APSRefreshInverterEnergyButton(hass, entry),
-        APSRefreshStorageButton(hass, entry),
-    ])
-
-
-class APSRefreshInvertersButton(ButtonEntity):
-    """Button to manually trigger an inverter list refresh."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Scan Inverters"
-    _attr_icon = "mdi:magnify-scan"
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
-        self._entry = entry
-        self._sid = entry.data["sid"]
-        self._attr_unique_id = f"{self._sid}_scan_inverters"
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._sid)},
-            "manufacturer": "APsystems",
-            "name": f"APsystems {self._sid}",
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "APsystems OpenAPI",
+        "description": "Saisissez les identifiants de votre compte APsystems OpenAPI ainsi que vos préférences d'interrogation.",
+        "data": {
+          "app_id": "Identifiant d'application (App ID)",
+          "app_secret": "Secret d'application (App Secret)",
+          "sid": "Identifiant de système (SID)",
+          "base_url": "URL de base de l'API",
+          "auto_scan_interval": "Optimiser automatiquement l'intervalle d'interrogation",
+          "scan_interval": "Intervalle d'interrogation (secondes)",
+          "sunrise_offset": "Décalage après le lever du soleil (minutes)",
+          "sunset_offset": "Décalage après le coucher du soleil (minutes)"
+        },
+        "data_description": {
+          "auto_scan_interval": "Lorsque cette option est activée, l'intervalle d'interrogation est calculé automatiquement pour rester dans le quota de l'API. Désactivez-la pour utiliser l'intervalle fixe ci-dessous.",
+          "scan_interval": "Secondes entre les appels à l'API pendant les heures d'ensoleillement (1800–7200, par défaut 1800 = 30 min). Ignoré lorsque l'optimisation automatique est activée.",
+          "sunrise_offset": "Minutes à attendre après le lever du soleil avant de commencer les appels à l'API (0–120, par défaut 30).",
+          "sunset_offset": "Minutes à attendre après le coucher du soleil avant d'arrêter les appels à l'API (0–120, par défaut 30)."
         }
-
-    async def async_press(self) -> None:
-        store = self.hass.data[DOMAIN][self._entry.entry_id]
-        refresh_fn = store["refresh_inverter_list"]
-        coordinator = store["coordinator"]
-
-        _LOGGER.info("Manual inverter scan triggered")
-        inverters = await refresh_fn()
-        _LOGGER.info("Scan complete: %d inverter(s) found", len(inverters))
-
-        # Trigger a coordinator refresh so new sensors pick up the updated list
-        await coordinator.async_request_refresh()
-
-
-class APSRefreshInverterEnergyButton(ButtonEntity):
-    """Button to manually trigger an inverter energy refresh."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Refresh Inverter Data"
-    _attr_icon = "mdi:solar-panel"
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
-        self._entry = entry
-        self._sid = entry.data["sid"]
-        self._attr_unique_id = f"{self._sid}_refresh_inverter_energy"
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._sid)},
-            "manufacturer": "APsystems",
-            "name": f"APsystems {self._sid}",
+      }
+    },
+    "error": {
+      "auth": "Échec de l'authentification. Vérifiez votre App ID, votre App Secret et votre System ID.",
+      "cannot_connect": "Impossible de se connecter à l'API APsystems. Vérifiez votre réseau et l'URL de base."
+    },
+    "abort": {
+      "already_configured": "Ce System ID est déjà configuré."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options APsystems OpenAPI",
+        "description": "Ajustez la fréquence à laquelle l'intégration interroge l'API APsystems. Le quota gratuit de l'OpenAPI est de 1000 appels par mois ; l'estimation correspondant à vos réglages actuels est inscrite dans le journal de Home Assistant à chaque démarrage de l'intégration.",
+        "data": {
+          "poll_pv": "Récupérer les données de production PV depuis le cloud",
+          "auto_scan_interval": "Optimiser automatiquement l'intervalle d'interrogation",
+          "scan_interval": "Intervalle d'interrogation (secondes)"
+        },
+        "data_description": {
+          "poll_pv": "Détermine si la production solaire est récupérée depuis le cloud APsystems. Désactivez cette option lorsque les mêmes données parviennent déjà à Home Assistant par le réseau local — par exemple via une intégration qui interroge directement l'ECU — car la copie cloud est alors redondante et simplement plus lente. Désactivée, l'API n'est utilisée que pour les données de la batterie : environ 60 appels par mois au lieu de 810, et l'intervalle ci-dessous n'a plus d'importance. Ne l'activez que si le cloud est votre seule source de données de production ; tant qu'elle est désactivée, les capteurs de production et de micro-onduleurs restent vides.",
+          "auto_scan_interval": "Lorsque cette option est activée, l'intervalle d'interrogation est calculé automatiquement pour rester dans le quota de l'API. Désactivez-la pour utiliser l'intervalle fixe ci-dessous.",
+          "scan_interval": "Secondes entre les appels à l'API pendant les heures d'ensoleillement (1800–7200, par défaut 1800 = 30 min). Ignoré lorsque l'optimisation automatique est activée, et totalement inutilisé lorsque la récupération PV depuis le cloud est désactivée."
         }
-
-    async def async_press(self) -> None:
-        store = self.hass.data[DOMAIN][self._entry.entry_id]
-        refresh_fn = store["refresh_inverter_energy"]
-        coordinator = store["coordinator"]
-
-        _LOGGER.info("Manual inverter energy refresh triggered")
-        energy = await refresh_fn()
-        _LOGGER.info("Inverter energy refresh complete: %d inverter(s)", len(energy))
-
-        await coordinator.async_request_refresh()
-
-class APSRefreshStorageButton(ButtonEntity):
-    """Button to manually fetch battery state and the previous day's balance.
-
-    Storage data is otherwise fetched once daily at 00:30. This button exists
-    so the data can be pulled on demand without waiting — and so no fetch
-    happens automatically on startup, which would cost 2 API calls per restart.
-    """
-
-    _attr_has_entity_name = True
-    _attr_name = "Refresh Storage Data"
-    _attr_icon = "mdi:battery-sync"
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
-        self._entry = entry
-        self._sid = entry.data["sid"]
-        self._attr_unique_id = f"{self._sid}_refresh_storage"
-
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {(DOMAIN, self._sid)},
-            "manufacturer": "APsystems",
-            "name": f"APsystems {self._sid}",
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "storage_mode": {
+        "state": {
+          "backup_power_supply": "Alimentation de secours",
+          "self_consumption": "Autoconsommation",
+          "advanced": "Avancé",
+          "peak_shaving": "Écrêtage des pointes"
         }
-
-    async def async_press(self) -> None:
-        store = self.hass.data[DOMAIN][self._entry.entry_id]
-        refresh_fn = store["refresh_storage"]
-        coordinator = store["coordinator"]
-
-        _LOGGER.info("Manual storage refresh triggered")
-        latest = await refresh_fn()
-        if latest:
-            _LOGGER.info("Storage refresh complete: SoC %s%%", latest.get("soc"))
-        else:
-            _LOGGER.info("Storage refresh returned no data (no storage ECU?)")
-
-        await coordinator.async_request_refresh()
+      }
+    }
+  }
+}
