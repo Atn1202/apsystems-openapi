@@ -1,15 +1,16 @@
 from __future__ import annotations
+
 import logging
 from datetime import timedelta
-import asyncio
-from homeassistant.core import HomeAssistant
+
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components import persistent_notification
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.util.dt import now, as_local
-from homeassistant.helpers.sun import get_astral_event_next
+from homeassistant.helpers.sun import get_astral_event_next, get_astral_event_date
 from homeassistant.helpers.event import async_track_point_in_utc_time
 
 from .const import (
@@ -55,11 +56,26 @@ def _clear_api_limit_notification(hass: HomeAssistant) -> None:
     persistent_notification.async_dismiss(hass, f"{DOMAIN}_api_limit")
 
 
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry so changed options take effect immediately.
+
+    Without this, an option changed in the UI is persisted to entry.options but
+    not applied until Home Assistant restarts.
+    """
+    await hass.config_entries.async_reload(entry.entry_id)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    data = entry.data  # <— fix
-    session = async_get_clientsession(hass)
+    # Credentials and the system identity are written once, at setup, and live
+    # in entry.data. The tunables below are editable through the options flow,
+    # which writes to entry.options — so they must be read from the merged view,
+    # with options winning. Reading entry.data alone silently ignored every
+    # option the user had set (notably poll_pv, which then fell back to its
+    # True default and kept cloud PV polling enabled).
+    data = entry.data
+    conf = {**entry.data, **entry.options}
 
+    session = async_get_clientsession(hass)
     client = APSClient(
         app_id=data["app_id"],
         app_secret=data["app_secret"],
@@ -100,14 +116,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "period": None,         # /storage/period payload for the previous day
         "fetched_date": None,   # date the period data covers
     }
-    
+
     def update_solar_state():
         """Check if we're currently in solar hours (30 min after sunrise to sunset)."""
-        from homeassistant.util.dt import now as dt_now
-        from homeassistant.helpers.sun import get_astral_event_date
-        import datetime
-
-        current_time = dt_now()
+        current_time = as_local(now())
         today = current_time.date()
 
         # Get sunrise and sunset for today
@@ -155,6 +167,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _notify_api_limit(hass, exc)
         except Exception as exc:
             _LOGGER.warning("Error fetching inverter list: %s", exc)
+
         if inverter_cache["list"] is None:
             inverter_cache["list"] = []
         return inverter_cache["list"]
@@ -178,6 +191,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 break  # limit hit — stop hammering the API for remaining inverters
             except Exception as exc:
                 _LOGGER.warning("Failed to fetch energy for inverter %s: %s", uid, exc)
+
         inverter_cache["energy"] = inv_energy
         inverter_cache["energy_date"] = date_str
         _LOGGER.info("Inverter energy fetched for %s (%d inverters)", date_str, len(inv_energy))
@@ -186,12 +200,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def refresh_batch_power():
         """Fetch batch power data for all ECUs (one call per ECU, covers all inverters)."""
         date_str = as_local(now()).date().isoformat()
+
         # Group inverters by ECU
         ecus = set()
         for inv in (inverter_cache["list"] or []):
             eid = inv.get("eid")
             if eid:
                 ecus.add(eid)
+
         batch_data = {}
         for eid in ecus:
             try:
@@ -205,14 +221,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 break  # limit hit — stop hammering the API for remaining ECUs
             except Exception as exc:
                 _LOGGER.warning("Failed to fetch batch power for ECU %s: %s", eid, exc)
+
         batch_power_cache["data"] = batch_data
         batch_power_cache["fetched_date"] = date_str
         _LOGGER.info("Batch power fetched for %s (%d ECUs)", date_str, len(batch_data))
+
         # Push updated data into the coordinator so sensors see it immediately
         if coordinator.data is not None:
             coordinator.data["batch_power"] = batch_power_cache["data"]
             coordinator.data["batch_power_date"] = batch_power_cache["fetched_date"]
             coordinator.async_set_updated_data(coordinator.data)
+
         return batch_data
 
     async def refresh_storage():
@@ -225,6 +244,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         if not eid:
             _LOGGER.debug("No storage-activated ECU found; skipping storage fetch")
             return None
+
         yesterday = (as_local(now()).date() - timedelta(days=1)).isoformat()
         try:
             latest = await client.get_storage_latest(eid)
@@ -252,13 +272,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             coordinator.data["storage_period"] = storage_cache["period"]
             coordinator.data["storage_date"] = storage_cache["fetched_date"]
             coordinator.async_set_updated_data(coordinator.data)
+
         return storage_cache["latest"]
-    
+
     async def _async_update():
         """Fetch data from API only during solar hours."""
         try:
             update_solar_state()
-            now_ts = _time.time()
 
             # ── Discover inverters on first run only ──
             if inverter_cache["list"] is None:
@@ -278,8 +298,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     cached.setdefault("storage_latest", storage_cache["latest"])
                     cached.setdefault("storage_period", storage_cache["period"])
                     cached.setdefault("storage_date", storage_cache["fetched_date"])
-                    
                     return cached
+
                 return {
                     "summary": None,
                     "hourly": None,
@@ -312,11 +332,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 result["storage_period"] = storage_cache["period"]
                 result["storage_date"] = storage_cache["fetched_date"]
                 return result
+
             # ── Solar-hours: fetch hourly (every cycle) ──
             date_str = as_local(now()).date().isoformat()
             hourly = await client.get_system_energy_hourly(date_str)
+
             # A successful call means we're under the limit again — clear any notice
             _clear_api_limit_notification(hass)
+
             if hourly.get("code") != 0:
                 _LOGGER.warning("APsystems hourly error: %s", hourly)
                 hourly = {"code": 0, "data": []}
@@ -330,6 +353,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 if sunset_time and current_time + timedelta(seconds=scan_interval) >= sunset_time:
                     need_summary = True
                     _LOGGER.debug("Near end of solar day, fetching daily summary")
+
             if need_summary:
                 summary = await client.get_system_summary()
                 if summary.get("code") != 0:
@@ -360,6 +384,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
             last_data.update(result)
             return result
+
         except APSRateLimitError as e:
             _notify_api_limit(hass, e)
             # Serve cached data so entities stay available instead of going
@@ -381,15 +406,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             raise UpdateFailed(str(e)) from e
 
     # Default 30-minute interval (~960 API calls/month with 6 inverters)
-    scan_interval = int(data.get("scan_interval", 1800))  # Default 30 minutes
+    scan_interval = int(conf.get("scan_interval", 1800))  # Default 30 minutes
+
     # When False, skip all cloud PV polling. Useful when inverter data is already
     # available locally (e.g. via a local ECU integration): the storage endpoints
     # are then the only reason to call the API, cutting usage from ~800 to ~60
     # calls/month.
-    poll_pv = data.get("poll_pv", True)
+    poll_pv = conf.get("poll_pv", True)
+
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
+        config_entry=entry,
         name=f"{DOMAIN}_coordinator",
         update_method=_async_update,
         update_interval=timedelta(seconds=scan_interval),
@@ -397,16 +425,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     await coordinator.async_config_entry_first_refresh()
 
-
     # ── Auto scan-interval ──────────────────────────────────────────────────
     # Once inverters are discovered, size the polling interval to the site's
     # longest day (from HA's configured latitude) and the inverter/ECU count so
     # the busiest month stays under the 1000 calls/month quota.
-    if data.get("auto_scan_interval", True):
+    if conf.get("auto_scan_interval", True):
         inverters = inverter_cache["list"] or []
         num_inverters = len(inverters)
         num_ecus = len({inv.get("eid") for inv in inverters if inv.get("eid")}) or 1
         latitude = hass.config.latitude
+
         if num_inverters and latitude is not None:
             recommended = recommended_scan_interval(latitude, num_inverters, num_ecus)
             est = estimate_monthly_calls(recommended, latitude, num_inverters, num_ecus)
@@ -434,12 +462,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         # transient empty response would wipe all inverter devices.
         if not inverters:
             return
+
         sid = data["sid"]
         # Include the storage device: it is not an inverter, so without this
         # the pruner treats it as stale and deletes it on every update.
         live_ids = {sid} | {inv["uid"] for inv in inverters if inv.get("uid")}
         if storage_cache.get("eid"):
             live_ids.add(f"{sid}_storage")
+
         device_reg = dr.async_get(hass)
         for device in dr.async_entries_for_config_entry(device_reg, entry.entry_id):
             device_ids = {ident for (domain, ident) in device.identifiers if domain == DOMAIN}
@@ -456,32 +486,84 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     _prune_stale_inverter_devices()
     entry.async_on_unload(coordinator.async_add_listener(_prune_stale_inverter_devices))
 
-    # Set up sunrise/sunset event listeners to trigger updates
-    async def handle_sun_event(event):
-        """Handle sunrise/sunset events."""
-        _LOGGER.info("Sun event triggered: %s", event)
+    # Reload the entry when options change, so a new poll_pv / scan_interval
+    # takes effect without a Home Assistant restart.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+    # ── Timed schedules ─────────────────────────────────────────────────────
+    # Every timer below re-arms itself after firing, so it survives past the
+    # first day. Each pending handle is kept here and cancelled on unload:
+    # without that, a reload (now routine, since options changes trigger one)
+    # would leave the previous entry's timers running alongside the new ones,
+    # duplicating the daily API calls once per reload.
+    scheduled_unsubs: dict[str, object] = {}
+
+    def _arm(key: str, target, action) -> None:
+        """Schedule `action` at `target`, replacing any pending timer for `key`."""
+        if (previous := scheduled_unsubs.pop(key, None)) is not None:
+            previous()
+        scheduled_unsubs[key] = async_track_point_in_utc_time(hass, action, target)
+
+    @callback
+    def _cancel_scheduled() -> None:
+        while scheduled_unsubs:
+            _, unsub = scheduled_unsubs.popitem()
+            unsub()
+
+    entry.async_on_unload(_cancel_scheduled)
+
+    def _next_sun_target(kind: str):
+        """Next sunrise/sunset plus 30 minutes, guaranteed to be in the future.
+
+        get_astral_event_next can return an event that the 30-minute offset
+        pushes into the past — and at the moment a handler re-arms itself it
+        may still return the event that just fired. Either would schedule a
+        point in the past, which fires immediately and spins.
+        """
+        event_time = get_astral_event_next(hass, kind)
+        if not event_time:
+            return None
+        target = event_time + timedelta(minutes=30)
+        while target <= now():
+            target += timedelta(days=1)
+        return target
+
+    async def _handle_sun_event(event, kind: str, reschedule) -> None:
+        """Update solar state, refresh if we just entered solar hours, re-arm."""
+        _LOGGER.info("Sun event triggered (%s): %s", kind, event)
         update_solar_state()
         if solar_active["is_active"]:
             # Trigger an immediate update when entering solar hours
             await coordinator.async_request_refresh()
+        await reschedule(now())
 
     # Track sunrise event (with 30 minute delay)
     async def schedule_sunrise_update(now_time):
-        """Schedule update 30 minutes after sunrise."""
-        sunrise_time = get_astral_event_next(hass, "sunrise")
-        if sunrise_time:
-            delayed_sunrise = sunrise_time + timedelta(minutes=30)
-            async_track_point_in_utc_time(hass, handle_sun_event, delayed_sunrise)
-            _LOGGER.info("Scheduled update for 30 min after sunrise: %s", delayed_sunrise)
+        """Schedule update 30 minutes after the next sunrise."""
+        target = _next_sun_target("sunrise")
+        if target is None:
+            _LOGGER.warning("No upcoming sunrise at this latitude; trigger not scheduled")
+            return
+
+        async def _run_sunrise(event):
+            await _handle_sun_event(event, "sunrise", schedule_sunrise_update)
+
+        _arm("sunrise", target, _run_sunrise)
+        _LOGGER.info("Scheduled update for 30 min after sunrise: %s", target)
 
     # Track sunset event
     async def schedule_sunset_update(now_time):
-        """Schedule update at 30 minutes after sunset."""
-        sunset_time = get_astral_event_next(hass, "sunset")
-        if sunset_time:
-            delayed_sunset = sunset_time + timedelta(minutes=30)
-            async_track_point_in_utc_time(hass, handle_sun_event, delayed_sunset)
-            _LOGGER.info("Scheduled update for 30 minutes after sunset: %s", delayed_sunset)
+        """Schedule update 30 minutes after the next sunset."""
+        target = _next_sun_target("sunset")
+        if target is None:
+            _LOGGER.warning("No upcoming sunset at this latitude; trigger not scheduled")
+            return
+
+        async def _run_sunset(event):
+            await _handle_sun_event(event, "sunset", schedule_sunset_update)
+
+        _arm("sunset", target, _run_sunset)
+        _LOGGER.info("Scheduled update for 30 minutes after sunset: %s", target)
 
     # Schedule batch power fetch at 11 PM daily
     async def schedule_batch_power(now_time):
@@ -490,11 +572,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         target = local_now.replace(hour=23, minute=0, second=0, microsecond=0)
         if local_now >= target:
             target += timedelta(days=1)
+
         async def _run_batch(event):
             await refresh_batch_power()
             # Re-schedule for the next day
             await schedule_batch_power(now())
-        async_track_point_in_utc_time(hass, _run_batch, target)
+
+        _arm("batch_power", target, _run_batch)
         _LOGGER.info("Scheduled batch power fetch at %s", target)
 
     # Schedule storage fetch at 00:30 daily — the previous day is then complete,
@@ -504,10 +588,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         target = local_now.replace(hour=0, minute=30, second=0, microsecond=0)
         if local_now >= target:
             target += timedelta(days=1)
+
         async def _run_storage(event):
             await refresh_storage()
             await schedule_storage(now())
-        async_track_point_in_utc_time(hass, _run_storage, target)
+
+        _arm("storage", target, _run_storage)
         _LOGGER.info("Scheduled storage fetch at %s", target)
 
     # Schedule midnight coordinator refresh to reset daily sensors
@@ -515,11 +601,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         """Schedule a coordinator refresh at midnight to reset daily sensors."""
         local_now = as_local(now())
         target = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
         async def _run_midnight(event):
             _LOGGER.info("Midnight refresh: resetting daily sensor data")
             await coordinator.async_request_refresh()
             await schedule_midnight_refresh(now())
-        async_track_point_in_utc_time(hass, _run_midnight, target)
+
+        _arm("midnight", target, _run_midnight)
         _LOGGER.info("Scheduled midnight refresh at %s", target)
 
     # Schedule the initial sun events
@@ -529,6 +617,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await schedule_batch_power(now())
     await schedule_midnight_refresh(now())
     await schedule_storage(now())
+
     # Store everything needed for sensors and button
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "client": client,
@@ -546,6 +635,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -580,4 +670,3 @@ async def async_remove_config_entry_device(
 
     # Allow removal only if none of this device's inverters are still reported.
     return device_ids.isdisjoint(live_uids)
-
