@@ -693,7 +693,7 @@ async def async_remove_config_entry_device(
     }
 
     # Allow removal only if none of this device's inverters are still reported.
-    return device_ids.isdisjoint(live_uids)    }
+    return device_ids.isdisjoint(live_uids)    
 
     # Summary tracking state (fetched once per day near end of solar hours)
     summary_cache = {
