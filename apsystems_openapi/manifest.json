@@ -1,11 +1,18 @@
 {
   "domain": "apsystems_openapi",
   "name": "APsystems OpenAPI",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "config_flow": true,
   "documentation": "https://github.com/emlynmac/apsystems-openapi",
-  "codeowners": ["@emlynmac"],
+  "codeowners": [
+    "@emlynmac"
+  ],
   "requirements": [],
   "iot_class": "cloud_polling",
-  "loggers": ["custom_components.apsystems_openapi"]
+  "loggers": [
+    "custom_components.apsystems_openapi"
+  ],
+  "dependencies": [
+    "recorder"
+  ]
 }

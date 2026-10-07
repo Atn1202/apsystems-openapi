@@ -7,8 +7,11 @@ can repopulate the battery sensors without spending a single API call.
 Layout, under ``<config>/apsystems_openapi/storage/<eid>/``:
 
     minutely/YYYY-MM-DD.json   /storage/period at "minutely" for that day
-    hourly/YYYY-MM-DD.json     /storage/period at "hourly" for that day
     latest/YYYY-MM.jsonl       one /storage/latest reading per line
+
+(1.5.0 also wrote hourly/YYYY-MM-DD.json — the API's "hourly" level. It is
+the minutely energy summed one slot late per hour, so it is no longer fetched;
+see storage_statistics.py.)
 
 All functions here do blocking file I/O: call them through
 ``hass.async_add_executor_job``.
@@ -45,6 +48,37 @@ def write_period(base: str, eid: str, level: str, data_date: str,
         json.dump(record, f, separators=(",", ":"))
     os.replace(tmp, path)  # atomic: a crash never leaves a half-written day
     return path
+
+
+def list_period_dates(base: str, eid: str, level: str) -> list[str]:
+    """Archived dates (YYYY-MM-DD) for a level, oldest first."""
+    try:
+        names = os.listdir(_storage_dir(base, eid, level))
+    except FileNotFoundError:
+        return []
+    return sorted(m.group(1) for n in names if (m := _DATE_FILE.match(n)))
+
+
+def read_period(base: str, eid: str, level: str, data_date: str):
+    """One archived day's payload, or None if absent or unreadable."""
+    try:
+        with open(os.path.join(_storage_dir(base, eid, level), f"{data_date}.json"),
+                  encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    data = record.get("data") if isinstance(record, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def read_all_periods(base: str, eid: str, level: str) -> list[tuple[str, dict]]:
+    """Every readable archived day for a level, oldest first."""
+    days = []
+    for data_date in list_period_dates(base, eid, level):
+        data = read_period(base, eid, level, data_date)
+        if data is not None:
+            days.append((data_date, data))
+    return days
 
 
 def read_latest_period(base: str, eid: str, level: str, before: str):

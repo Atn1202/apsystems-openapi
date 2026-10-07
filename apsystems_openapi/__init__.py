@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import logging
 from datetime import timedelta
 
@@ -25,11 +26,13 @@ from .const import (
     STORAGE_POLL_MONTHLY_CAP,
     STORAGE_LATEST_MAX_AGE_HOURLY_S,
     STORAGE_LATEST_MAX_AGE_DAILY_S,
+    BACKFILL_DAYS,
     recommended_scan_interval,
     estimate_monthly_calls,
+    storage_calls_per_day,
 )
 from .api import APSClient, APSRateLimitError
-from . import storage_archive
+from . import storage_archive, storage_statistics
 
 import time as _time
 
@@ -150,6 +153,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await hass.async_add_executor_job(func, archive_base, *args)
         except Exception as exc:  # the archive must never break a fetch
             _LOGGER.warning("Could not archive storage data: %s", exc)
+
+    async def _import_statistics(days) -> list[str]:
+        """Hourly external statistics for archived days (storage_statistics)."""
+        try:
+            return await storage_statistics.async_import_days(
+                hass, DOMAIN, storage_cache["eid"], days
+            )
+        except Exception as exc:  # statistics must never break a fetch either
+            _LOGGER.warning("Battery statistics import failed: %s", exc)
+            return []
 
     # ── Monthly API call count ──────────────────────────────────────────────
     # Counted here because the APsystems portal's own counter lags by days.
@@ -316,11 +329,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def refresh_storage(include_latest: bool | None = None):
         """Fetch the previous day's full energy balance, and battery state.
 
-        Two calls. Runs just after midnight so the previous day is complete,
-        including the overnight discharge a pre-midnight fetch would miss.
-        With the hourly poll on, the poll already supplies the latest reading,
-        so this fetches the previous day's hourly series in its place;
-        `include_latest=True` (the refresh button) fetches it regardless.
+        Two calls, or one with the hourly poll on (the poll already supplies
+        the latest reading; `include_latest=True`, the refresh button, fetches
+        it regardless). Runs just after midnight so the previous day is
+        complete, including the overnight discharge a pre-midnight fetch would
+        miss. The day is archived and imported as hourly statistics.
         """
         eid = storage_cache["eid"]
         if not eid:
@@ -344,21 +357,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     storage_archive.write_period, eid, "minutely", yesterday,
                     as_local(now()).isoformat(timespec="seconds"), storage_cache["period"],
                 )
+                await _import_statistics([(yesterday, storage_cache["period"])])
             elif isinstance(period, dict) and period.get("code") == 1001:
                 _LOGGER.debug("No storage data yet for %s (code 1001)", yesterday)
             else:
                 _LOGGER.warning("Storage period error: %s", period)
-
-            if poll_storage_hourly:
-                # Archived only, for now: the vendor's own hourly totals.
-                hourly = await client.get_storage_period(eid, yesterday, energy_level="hourly")
-                if isinstance(hourly, dict) and hourly.get("code") == 0:
-                    await _archive(
-                        storage_archive.write_period, eid, "hourly", yesterday,
-                        as_local(now()).isoformat(timespec="seconds"), hourly.get("data"),
-                    )
-                else:
-                    _LOGGER.warning("Storage hourly period error: %s", hourly)
         except APSRateLimitError as exc:
             _notify_api_limit(hass, exc)
         except Exception as exc:
@@ -384,6 +387,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER.debug("Storage poll: SoC %s%% at %s", data.get("soc"), data.get("time"))
         _push_storage_update()
         return data
+
+    async def backfill_storage(days_back: int = BACKFILL_DAYS) -> int:
+        """Fetch missing past days into the archive, then rebuild the hourly
+        statistics from the earliest archived day.
+
+        One call per missing day, never more than the month's budget leaves
+        once the remaining days' scheduled calls are set aside — most recent
+        days first. Returns the number of days fetched.
+        """
+        eid = storage_cache["eid"]
+        if not eid:
+            return 0
+        today = as_local(now()).date()
+        wanted = [(today - timedelta(days=k)).isoformat() for k in range(days_back, 0, -1)]
+        have = set(await hass.async_add_executor_job(
+            storage_archive.list_period_dates, archive_base, eid, "minutely"
+        ))
+        missing = [d for d in wanted if d not in have]
+
+        remaining_days = calendar.monthrange(today.year, today.month)[1] - today.day + 1
+        budget = max(0, STORAGE_POLL_MONTHLY_CAP - call_count.get("calls", 0)
+                     - remaining_days * storage_calls_per_day(poll_storage_hourly))
+        if len(missing) > budget:
+            _LOGGER.warning(
+                "Backfill: %d day(s) missing but this month's budget allows %d; "
+                "fetching the most recent %d", len(missing), budget, budget,
+            )
+            missing = missing[len(missing) - budget:]
+
+        fetched = 0
+        for day in missing:
+            try:
+                resp = await client.get_storage_period(eid, day, energy_level="minutely")
+            except APSRateLimitError as exc:
+                _notify_api_limit(hass, exc)
+                break
+            except Exception as exc:
+                _LOGGER.warning("Backfill: %s failed: %s", day, exc)
+                continue
+            if isinstance(resp, dict) and resp.get("code") == 0 and isinstance(resp.get("data"), dict):
+                await _archive(storage_archive.write_period, eid, "minutely", day,
+                               as_local(now()).isoformat(timespec="seconds"), resp["data"])
+                fetched += 1
+            elif isinstance(resp, dict) and resp.get("code") == 1001:
+                _LOGGER.debug("Backfill: no storage data for %s (code 1001)", day)
+            else:
+                _LOGGER.warning("Backfill: %s returned %s", day, resp)
+
+        days = await hass.async_add_executor_job(
+            storage_archive.read_all_periods, archive_base, eid, "minutely"
+        )
+        imported = await _import_statistics(days)
+        _LOGGER.info("Backfill: fetched %d day(s); statistics rebuilt for %d of %d archived day(s)",
+                     fetched, len(imported), len(days))
+        return fetched
 
     async def _restore_storage_from_archive() -> None:
         """Repopulate the storage cache from the archive — zero API calls.
@@ -832,6 +890,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "refresh_batch_power": refresh_batch_power,
         "refresh_storage": refresh_storage,
         "refresh_storage_latest": refresh_storage_latest,
+        "backfill_storage": backfill_storage,
         "storage_cache": storage_cache,
         "storage_latest_max_age": storage_latest_max_age,
         "call_count": call_count,

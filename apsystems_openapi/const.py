@@ -46,7 +46,7 @@ DEFAULT_SCAN_INTERVAL = 3600  # seconds (hourly energy)
 # daily storage calls remain: ≈ 62 calls/month regardless of interval or
 # latitude.  In that configuration the scan interval has no effect on quota.
 # Adding the hourly storage poll (poll_storage_hourly) brings it to
-# 31 × (2 + 24) ≈ 806 calls/month — which is why it is off by default, and why
+# 31 × (1 + 24) ≈ 775 calls/month — which is why it is off by default, and why
 # it cannot be combined with poll_pv without exceeding the quota.
 
 # ── API rate-limit / access-limit response codes ───────────────────────────
@@ -68,10 +68,14 @@ MAX_SCAN_INTERVAL = 7200   # 2 hours
 SCAN_INTERVAL_STEP = 300   # round recommendations up to a clean 5-min step
 
 # Storage endpoints, fetched once daily at 00:30.  Independent of poll_pv — the
-# battery data has no local source.  Two calls either way: /storage/latest +
-# /storage/period minutely, or — when the hourly poll below already supplies
-# the latest reading — /storage/period minutely + /storage/period hourly.
+# battery data has no local source.  /storage/period minutely always, plus
+# /storage/latest unless the hourly poll below already supplies it.
 STORAGE_CALLS_PER_DAY = 2
+
+# "Backfill Battery History" button: fetch up to this many missing past days
+# (1 call each), within what the month's budget leaves after projecting the
+# remaining days' scheduled calls.
+BACKFILL_DAYS = 60
 
 # Optional hourly /storage/latest poll (option poll_storage_hourly): one call
 # at STORAGE_POLL_MINUTE past every hour, round the clock — 24 a day, ~744 in a
@@ -152,11 +156,15 @@ def estimate_monthly_calls(
         daily += 2 + num_inverters + num_ecus
 
     if has_storage:
-        daily += STORAGE_CALLS_PER_DAY
-        if storage_hourly:
-            daily += STORAGE_POLL_CALLS_PER_DAY
+        daily += storage_calls_per_day(storage_hourly)
 
     return round(DAYS_PER_MONTH * daily)
+
+
+def storage_calls_per_day(storage_hourly: bool) -> int:
+    """Scheduled storage calls a day: the 00:30 period fetch, plus the latest
+    reading either hourly or once at 00:30."""
+    return 1 + (STORAGE_POLL_CALLS_PER_DAY if storage_hourly else 1)
 
 
 def recommended_scan_interval(
@@ -186,9 +194,7 @@ def recommended_scan_interval(
     window = max(0.0, max_daylight_hours(latitude) - sunrise_offset_min / 60.0)
     daily_fixed = 2 + num_inverters + num_ecus
     if has_storage:
-        daily_fixed += STORAGE_CALLS_PER_DAY
-        if storage_hourly:
-            daily_fixed += STORAGE_POLL_CALLS_PER_DAY
+        daily_fixed += storage_calls_per_day(storage_hourly)
 
     budget_per_day = (quota * safety) / DAYS_PER_MONTH
     remaining = budget_per_day - daily_fixed

@@ -31,6 +31,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # storage-activated ECU.
     if (store.get("storage_cache") or {}).get("eid"):
         buttons.append(APSRefreshStorageButton(entry, sid))
+        buttons.append(APSBackfillStorageButton(entry, sid))
 
     async_add_entities(buttons)
 
@@ -108,7 +109,7 @@ class APSRefreshStorageButton(_APSButtonBase):
     Storage data is otherwise fetched daily at 00:30 (and the battery state
     hourly, if that option is on). Restarts restore it from the on-disk
     archive, so pressing this is only needed before the first archive exists.
-    Costs 2 calls, or 3 with the hourly poll on (the hourly series too).
+    Costs 2 calls.
     """
 
     _attr_name = "Refresh Storage Data"
@@ -126,3 +127,24 @@ class APSRefreshStorageButton(_APSButtonBase):
         else:
             _LOGGER.info("Storage refresh returned no data (no storage ECU?)")
         await store["coordinator"].async_request_refresh()
+
+
+class APSBackfillStorageButton(_APSButtonBase):
+    """Button to fill the battery archive and hourly statistics backwards.
+
+    Fetches each missing day of the last BACKFILL_DAYS (1 call per day, within
+    what the month's budget leaves), then rebuilds the hourly statistics from
+    the earliest archived day. Days already archived cost nothing.
+    """
+
+    _attr_name = "Backfill Battery History"
+    _attr_icon = "mdi:history"
+
+    def __init__(self, entry: ConfigEntry, sid: str):
+        super().__init__(entry, sid, "backfill_storage")
+
+    async def async_press(self) -> None:
+        store = self._store
+        _LOGGER.info("Manual storage backfill triggered")
+        fetched = await store["backfill_storage"]()
+        _LOGGER.info("Storage backfill complete: %d day(s) fetched", fetched)
