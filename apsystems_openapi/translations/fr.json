@@ -38,12 +38,14 @@
         "data": {
           "poll_pv": "Récupérer les données de production PV depuis le cloud",
           "auto_scan_interval": "Optimiser automatiquement l'intervalle d'interrogation",
-          "scan_interval": "Intervalle d'interrogation (secondes)"
+          "scan_interval": "Intervalle d'interrogation (secondes)",
+          "poll_storage_hourly": "Relever l'état de la batterie toutes les heures"
         },
         "data_description": {
           "poll_pv": "Détermine si la production solaire est récupérée depuis le cloud APsystems. Désactivez cette option lorsque les mêmes données parviennent déjà à Home Assistant par le réseau local — par exemple via une intégration qui interroge directement l'ECU — car la copie cloud est alors redondante et simplement plus lente. Désactivée, l'API n'est utilisée que pour les données de la batterie : environ 60 appels par mois au lieu de 810, et l'intervalle ci-dessous n'a plus d'importance. Ne l'activez que si le cloud est votre seule source de données de production ; tant qu'elle est désactivée, les capteurs de production et de micro-onduleurs restent vides.",
           "auto_scan_interval": "Lorsque cette option est activée, l'intervalle d'interrogation est calculé automatiquement pour rester dans le quota de l'API. Désactivez-la pour utiliser l'intervalle fixe ci-dessous.",
-          "scan_interval": "Secondes entre les appels à l'API pendant les heures d'ensoleillement (1800–7200, par défaut 1800 = 30 min). Ignoré lorsque l'optimisation automatique est activée, et totalement inutilisé lorsque la récupération PV depuis le cloud est désactivée."
+          "scan_interval": "Secondes entre les appels à l'API pendant les heures d'ensoleillement (1800–7200, par défaut 1800 = 30 min). Ignoré lorsque l'optimisation automatique est activée, et totalement inutilisé lorsque la récupération PV depuis le cloud est désactivée.",
+          "poll_storage_hourly": "Relève l'état de charge et le mode de la batterie à 5 minutes de chaque heure, jour et nuit : environ 744 appels d'API par mois en plus des 60 du relevé quotidien — environ 806 au total, dans le quota de 1000 mais seulement si le relevé PV dans le cloud est désactivé. Les relevés s'arrêtent pour le reste du mois dès que 900 appels ont été comptés, pour ne jamais priver le relevé quotidien. Désactivé, l'état de la batterie est relevé une fois par jour à 00:30."
         }
       }
     }
@@ -55,7 +57,8 @@
           "backup_power_supply": "Alimentation de secours",
           "self_consumption": "Autoconsommation",
           "advanced": "Avancé",
-          "peak_shaving": "Écrêtage des pointes"
+          "peak_shaving": "Écrêtage des pointes",
+          "time_based_control": "Contrôle horaire"
         }
       }
     }

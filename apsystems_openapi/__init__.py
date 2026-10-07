@@ -9,9 +9,10 @@ from homeassistant.components import persistent_notification
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers import device_registry as dr
-from homeassistant.util.dt import now, as_local
+from homeassistant.util.dt import now, as_local, utcnow
 from homeassistant.helpers.sun import get_astral_event_next, get_astral_event_date
 from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.storage import Store
 
 from .const import (
     DOMAIN,
@@ -19,10 +20,16 @@ from .const import (
     DEFAULT_BASE_URL,
     API_LIMIT_CODE_MESSAGES,
     MONTHLY_API_QUOTA,
+    ARCHIVE_DIR,
+    STORAGE_POLL_MINUTE,
+    STORAGE_POLL_MONTHLY_CAP,
+    STORAGE_LATEST_MAX_AGE_HOURLY_S,
+    STORAGE_LATEST_MAX_AGE_DAILY_S,
     recommended_scan_interval,
     estimate_monthly_calls,
 )
 from .api import APSClient, APSRateLimitError
+from . import storage_archive
 
 import time as _time
 
@@ -113,9 +120,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     storage_cache = {
         "eid": None,            # storage-activated ECU (the PCS serial)
         "latest": None,         # /storage/latest payload
+        "latest_fetched_at": None,  # ISO time we fetched it (the API gives HH:MM only)
         "period": None,         # /storage/period payload for the previous day
         "fetched_date": None,   # date the period data covers
     }
+
+    def _storage_fields() -> dict:
+        """The storage keys every coordinator payload carries."""
+        return {
+            "storage_latest": storage_cache["latest"],
+            "storage_latest_fetched_at": storage_cache["latest_fetched_at"],
+            "storage_period": storage_cache["period"],
+            "storage_date": storage_cache["fetched_date"],
+        }
+
+    def _push_storage_update() -> None:
+        """Hand fresh storage data to the sensors without a coordinator cycle."""
+        if coordinator.data is not None:
+            coordinator.data.update(_storage_fields())
+            coordinator.async_set_updated_data(coordinator.data)
+
+    # Every storage payload is archived to disk as it arrives
+    # (storage_archive.py): nothing the API returned is thrown away, and a
+    # restart repopulates the battery sensors from the files at zero API cost.
+    archive_base = hass.config.path(ARCHIVE_DIR)
+
+    async def _archive(func, *args) -> None:
+        try:
+            await hass.async_add_executor_job(func, archive_base, *args)
+        except Exception as exc:  # the archive must never break a fetch
+            _LOGGER.warning("Could not archive storage data: %s", exc)
+
+    # ── Monthly API call count ──────────────────────────────────────────────
+    # Counted here because the APsystems portal's own counter lags by days.
+    # Persisted so a restart does not reset it; it gates the hourly storage
+    # poll (STORAGE_POLL_MONTHLY_CAP).
+    call_store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.api_calls")
+    call_count = await call_store.async_load() or {}
+    this_month = as_local(now()).strftime("%Y-%m")
+    if not call_count:
+        # First start with counting: seed with a deliberately high estimate of
+        # what this month has already used (2 storage calls a day, plus slack).
+        call_count = {"month": this_month, "calls": 2 * as_local(now()).day + 5,
+                      "estimated": True}
+    elif call_count.get("month") != this_month:
+        call_count = {"month": this_month, "calls": 0, "estimated": False}
+
+    @callback
+    def _count_call(path: str) -> None:
+        month = as_local(now()).strftime("%Y-%m")
+        if call_count.get("month") != month:
+            call_count.clear()
+            call_count.update({"month": month, "calls": 0, "estimated": False})
+        call_count["calls"] = call_count.get("calls", 0) + 1
+        call_store.async_delay_save(lambda: dict(call_count), 30)
+
+    client.on_call = _count_call
 
     def update_solar_state():
         """Check if we're currently in solar hours (30 min after sunrise to sunset)."""
@@ -234,46 +294,125 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
         return batch_data
 
-    async def refresh_storage():
-        """Fetch battery state and the previous day's full energy balance.
+    async def _fetch_storage_latest():
+        """One /storage/latest call: cache it, timestamp it, archive it.
+
+        Returns the payload, or None on an API error. Lets APSRateLimitError
+        and transport errors propagate to the caller.
+        """
+        eid = storage_cache["eid"]
+        resp = await client.get_storage_latest(eid)
+        if not (isinstance(resp, dict) and resp.get("code") == 0):
+            _LOGGER.warning("Storage latest error: %s", resp)
+            return None
+        data = resp.get("data") or {}
+        fetched_at = as_local(now()).isoformat(timespec="seconds")
+        storage_cache["latest"] = data
+        storage_cache["latest_fetched_at"] = fetched_at
+        await _archive(storage_archive.append_latest, eid,
+                       {"fetched_at": fetched_at, "data": data})
+        return data
+
+    async def refresh_storage(include_latest: bool | None = None):
+        """Fetch the previous day's full energy balance, and battery state.
 
         Two calls. Runs just after midnight so the previous day is complete,
         including the overnight discharge a pre-midnight fetch would miss.
+        With the hourly poll on, the poll already supplies the latest reading,
+        so this fetches the previous day's hourly series in its place;
+        `include_latest=True` (the refresh button) fetches it regardless.
         """
         eid = storage_cache["eid"]
         if not eid:
             _LOGGER.debug("No storage-activated ECU found; skipping storage fetch")
             return None
 
+        if include_latest is None:
+            include_latest = not poll_storage_hourly
+
         yesterday = (as_local(now()).date() - timedelta(days=1)).isoformat()
         try:
-            latest = await client.get_storage_latest(eid)
-            if isinstance(latest, dict) and latest.get("code") == 0:
-                storage_cache["latest"] = latest.get("data", {})
-            else:
-                _LOGGER.warning("Storage latest error: %s", latest)
+            if include_latest:
+                await _fetch_storage_latest()
 
             period = await client.get_storage_period(eid, yesterday, energy_level="minutely")
             if isinstance(period, dict) and period.get("code") == 0:
                 storage_cache["period"] = period.get("data", {})
                 storage_cache["fetched_date"] = yesterday
                 _LOGGER.info("Storage data fetched for %s", yesterday)
+                await _archive(
+                    storage_archive.write_period, eid, "minutely", yesterday,
+                    as_local(now()).isoformat(timespec="seconds"), storage_cache["period"],
+                )
             elif isinstance(period, dict) and period.get("code") == 1001:
                 _LOGGER.debug("No storage data yet for %s (code 1001)", yesterday)
             else:
                 _LOGGER.warning("Storage period error: %s", period)
+
+            if poll_storage_hourly:
+                # Archived only, for now: the vendor's own hourly totals.
+                hourly = await client.get_storage_period(eid, yesterday, energy_level="hourly")
+                if isinstance(hourly, dict) and hourly.get("code") == 0:
+                    await _archive(
+                        storage_archive.write_period, eid, "hourly", yesterday,
+                        as_local(now()).isoformat(timespec="seconds"), hourly.get("data"),
+                    )
+                else:
+                    _LOGGER.warning("Storage hourly period error: %s", hourly)
         except APSRateLimitError as exc:
             _notify_api_limit(hass, exc)
         except Exception as exc:
             _LOGGER.warning("Error fetching storage data: %s", exc)
 
-        if coordinator.data is not None:
-            coordinator.data["storage_latest"] = storage_cache["latest"]
-            coordinator.data["storage_period"] = storage_cache["period"]
-            coordinator.data["storage_date"] = storage_cache["fetched_date"]
-            coordinator.async_set_updated_data(coordinator.data)
-
+        _push_storage_update()
         return storage_cache["latest"]
+
+    async def refresh_storage_latest():
+        """The hourly poll: one /storage/latest call."""
+        if not storage_cache["eid"]:
+            return None
+        try:
+            data = await _fetch_storage_latest()
+        except APSRateLimitError as exc:
+            _notify_api_limit(hass, exc)
+            return None
+        except Exception as exc:
+            _LOGGER.warning("Error fetching storage latest: %s", exc)
+            return None
+        if data is not None:
+            _clear_api_limit_notification(hass)
+            _LOGGER.debug("Storage poll: SoC %s%% at %s", data.get("soc"), data.get("time"))
+        _push_storage_update()
+        return data
+
+    async def _restore_storage_from_archive() -> None:
+        """Repopulate the storage cache from the archive — zero API calls.
+
+        Without this every restart blanked the battery sensors until the next
+        00:30 fetch. The newest archived day before today is what the sensors
+        showed before the restart.
+        """
+        eid = storage_cache["eid"]
+        today = as_local(now()).date().isoformat()
+        try:
+            period = await hass.async_add_executor_job(
+                storage_archive.read_latest_period, archive_base, eid, "minutely", today
+            )
+            latest = await hass.async_add_executor_job(
+                storage_archive.read_last_latest, archive_base, eid
+            )
+        except Exception as exc:
+            _LOGGER.warning("Could not read the storage archive: %s", exc)
+            return
+        if period:
+            storage_cache["fetched_date"], storage_cache["period"] = period
+        if latest:
+            storage_cache["latest"] = latest["data"]
+            storage_cache["latest_fetched_at"] = latest.get("fetched_at")
+        _LOGGER.info(
+            "Storage restored from archive: balance for %s, latest reading fetched %s",
+            storage_cache["fetched_date"] or "none", storage_cache["latest_fetched_at"] or "never",
+        )
 
     async def _async_update():
         """Fetch data from API only during solar hours."""
@@ -295,9 +434,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
                     cached.setdefault("batch_power", batch_power_cache["data"])
                     cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
-                    cached.setdefault("storage_latest", storage_cache["latest"])
-                    cached.setdefault("storage_period", storage_cache["period"])
-                    cached.setdefault("storage_date", storage_cache["fetched_date"])
+                    # update, not setdefault: last_data may hold older storage data
+                    cached.update(_storage_fields())
                     return cached
 
                 return {
@@ -310,9 +448,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                     "inverter_energy_date": inverter_cache["energy_date"],
                     "batch_power": batch_power_cache["data"],
                     "batch_power_date": batch_power_cache["fetched_date"],
-                    "storage_latest": storage_cache["latest"],
-                    "storage_period": storage_cache["period"],
-                    "storage_date": storage_cache["fetched_date"],
+                    **_storage_fields(),
                 }
 
             # ── PV polling disabled: return cached shape without API calls ──
@@ -328,9 +464,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 result["inverter_energy_date"] = inverter_cache["energy_date"]
                 result["batch_power"] = batch_power_cache["data"]
                 result["batch_power_date"] = batch_power_cache["fetched_date"]
-                result["storage_latest"] = storage_cache["latest"]
-                result["storage_period"] = storage_cache["period"]
-                result["storage_date"] = storage_cache["fetched_date"]
+                result.update(_storage_fields())
                 return result
 
             # ── Solar-hours: fetch hourly (every cycle) ──
@@ -378,9 +512,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             result["inverter_energy_date"] = inverter_cache["energy_date"]
             result["batch_power"] = batch_power_cache["data"]
             result["batch_power_date"] = batch_power_cache["fetched_date"]
-            result["storage_latest"] = storage_cache["latest"]
-            result["storage_period"] = storage_cache["period"]
-            result["storage_date"] = storage_cache["fetched_date"]
+            result.update(_storage_fields())
 
             last_data.update(result)
             return result
@@ -397,9 +529,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 cached.setdefault("inverter_energy_date", inverter_cache["energy_date"])
                 cached.setdefault("batch_power", batch_power_cache["data"])
                 cached.setdefault("batch_power_date", batch_power_cache["fetched_date"])
-                cached.setdefault("storage_latest", storage_cache["latest"])
-                cached.setdefault("storage_period", storage_cache["period"])
-                cached.setdefault("storage_date", storage_cache["fetched_date"])
+                cached.update(_storage_fields())
                 return cached
             raise UpdateFailed(str(e)) from e
         except Exception as e:
@@ -414,6 +544,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     # calls/month.
     poll_pv = conf.get("poll_pv", True)
 
+    # When True, read /storage/latest once an hour (STORAGE_POLL_MINUTE past),
+    # round the clock: ~744 calls/month on top of the daily fetch. Off by
+    # default — combined with poll_pv it would exceed the quota.
+    poll_storage_hourly = conf.get("poll_storage_hourly", False)
+    storage_latest_max_age = (
+        STORAGE_LATEST_MAX_AGE_HOURLY_S if poll_storage_hourly
+        else STORAGE_LATEST_MAX_AGE_DAILY_S
+    )
+
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -424,6 +563,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     )
 
     await coordinator.async_config_entry_first_refresh()
+
+    # The first refresh discovered the storage ECU, if any: restore its data
+    # from the archive before the sensors are created.
+    if storage_cache["eid"]:
+        await _restore_storage_from_archive()
+        if coordinator.data is not None:
+            coordinator.data.update(_storage_fields())
 
     # ── Auto scan-interval ──────────────────────────────────────────────────
     # Once inverters are discovered, size the polling interval to the site's
@@ -443,20 +589,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         est = estimate_monthly_calls(
             scan_interval, latitude or 0.0, num_inverters, num_ecus,
             poll_pv=False, has_storage=has_storage,
+            storage_hourly=poll_storage_hourly and has_storage,
         )
         _LOGGER.info(
-            "Cloud PV polling disabled; scan interval left at %ds — "
-            "est. %d calls/month (quota %d)",
-            scan_interval, est, MONTHLY_API_QUOTA,
+            "Cloud PV polling disabled; scan interval left at %ds; hourly storage "
+            "poll %s — est. %d calls/month (quota %d; %d counted so far in %s%s)",
+            scan_interval, "on" if poll_storage_hourly else "off", est,
+            MONTHLY_API_QUOTA, call_count.get("calls", 0), call_count.get("month"),
+            ", estimated" if call_count.get("estimated") else "",
         )
     elif conf.get("auto_scan_interval", True):
         if num_inverters and latitude is not None:
             recommended = recommended_scan_interval(
-                latitude, num_inverters, num_ecus, has_storage=has_storage
+                latitude, num_inverters, num_ecus, has_storage=has_storage,
+                storage_hourly=poll_storage_hourly,
             )
             est = estimate_monthly_calls(
                 recommended, latitude, num_inverters, num_ecus,
-                has_storage=has_storage,
+                has_storage=has_storage, storage_hourly=poll_storage_hourly,
             )
             _LOGGER.info(
                 "Auto scan-interval: %ds (%.0f min) for %d inverter(s)/%d ECU(s)"
@@ -617,6 +767,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         _arm("storage", target, _run_storage)
         _LOGGER.info("Scheduled storage fetch at %s", target)
 
+    # Hourly /storage/latest poll, STORAGE_POLL_MINUTE past every hour.
+    # Computed in UTC so DST changes cannot produce a non-existent local time.
+    cap_warned = {"month": None}
+
+    async def schedule_storage_poll(now_time):
+        utc_now = utcnow()
+        target = utc_now.replace(minute=STORAGE_POLL_MINUTE, second=0, microsecond=0)
+        if target <= utc_now:
+            target += timedelta(hours=1)
+
+        async def _run_poll(event):
+            try:
+                if call_count.get("calls", 0) >= STORAGE_POLL_MONTHLY_CAP:
+                    if cap_warned["month"] != call_count.get("month"):
+                        cap_warned["month"] = call_count.get("month")
+                        _LOGGER.warning(
+                            "Hourly storage poll paused for %s: %d API calls counted, "
+                            "cap %d. The daily 00:30 fetch continues.",
+                            call_count.get("month"), call_count.get("calls", 0),
+                            STORAGE_POLL_MONTHLY_CAP,
+                        )
+                else:
+                    await refresh_storage_latest()
+            finally:
+                # Re-arm whatever happened: a poll that dies once must not
+                # end the series.
+                await schedule_storage_poll(now())
+
+        _arm("storage_poll", target, _run_poll)
+        _LOGGER.debug("Scheduled storage poll at %s", target)
+
     # Schedule midnight coordinator refresh to reset daily sensors
     async def schedule_midnight_refresh(now_time):
         """Schedule a coordinator refresh at midnight to reset daily sensors."""
@@ -638,6 +819,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await schedule_batch_power(now())
     await schedule_midnight_refresh(now())
     await schedule_storage(now())
+    if poll_storage_hourly and storage_cache["eid"]:
+        await schedule_storage_poll(now())
+        _LOGGER.info("Hourly storage poll on, at :%02d past each hour", STORAGE_POLL_MINUTE)
 
     # Store everything needed for sensors and button
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
@@ -647,7 +831,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         "refresh_inverter_energy": refresh_inverter_energy,
         "refresh_batch_power": refresh_batch_power,
         "refresh_storage": refresh_storage,
+        "refresh_storage_latest": refresh_storage_latest,
         "storage_cache": storage_cache,
+        "storage_latest_max_age": storage_latest_max_age,
+        "call_count": call_count,
         # Platforms read this to decide whether cloud-PV-only entities are
         # worth creating at all.
         "poll_pv": poll_pv,

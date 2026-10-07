@@ -62,6 +62,9 @@ class APSClient:
         self.base_url = base_url.rstrip("/")
         self._session = session or aiohttp.ClientSession()
         self._owns_session = session is None # track ownership
+        # Optional callable(path) invoked once per request, before it is sent —
+        # every request counts against the monthly quota, failed ones included.
+        self.on_call = None
 
     async def close(self):
         if self._owns_session and self._session and not self._session.closed:
@@ -72,6 +75,11 @@ class APSClient:
         headers, s2s = _build_signature(self.app_id, self.app_secret, path, "GET")
         # Helpful debug line:
         _LOGGER.debug("APS GET %s params=%s s2s_preview=%s…", path, params, s2s[:60])
+        if self.on_call is not None:
+            try:
+                self.on_call(path)
+            except Exception:  # a counting bug must never block the request
+                _LOGGER.exception("API call counter failed")
         async with self._session.get(url, headers=headers, params=params) as r:
             txt = await r.text()
             _LOGGER.debug("APS %s → %s %s", url, r.status, txt[:500])

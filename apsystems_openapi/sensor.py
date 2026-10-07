@@ -5,6 +5,7 @@ from datetime import datetime as dt_datetime
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
 from homeassistant.components.sensor.const import SensorStateClass
 from homeassistant.const import (
+    EntityCategory,
     PERCENTAGE,
     UnitOfEnergy,
     UnitOfPower,
@@ -23,7 +24,7 @@ from homeassistant.util.dt import now as dt_now
 
 import logging
 
-from .const import DOMAIN
+from .const import DOMAIN, MONTHLY_API_QUOTA, STORAGE_POLL_MONTHLY_CAP
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,8 +74,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # fetched data instead would never fire: the cache is rebuilt empty on every
     # setup, so data fetched before a reload is gone by the time this runs.
     if _safe_dict(store.get("storage_cache")).get("eid"):
-        entities.append(APSStorageSoCSensor(coordinator, sid))
-        entities.append(APSStorageModeSensor(coordinator, sid))
+        max_age = store.get("storage_latest_max_age")
+        entities.append(APSStorageSoCSensor(coordinator, sid, max_age))
+        entities.append(APSStorageModeSensor(coordinator, sid, max_age))
         for suffix, name, field in (
             ("charged", "Charged", "charge"),
             ("discharged", "Discharged", "discharge"),
@@ -84,6 +86,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             ("exported", "Grid Exported", "exported"),
         ):
             entities.append(APSStorageDailyEnergySensor(coordinator, sid, suffix, name, field))
+
+    if store.get("call_count") is not None:
+        entities.append(APSApiCallsSensor(coordinator, sid, store["call_count"]))
 
     async_add_entities(entities)
 
@@ -470,15 +475,35 @@ class APSInverterTemperatureSensor(_APSInverterFieldSensor):
 # ---------------------------------------------------------------------------
 # Storage (battery) sensors
 # ---------------------------------------------------------------------------
-# Only mode "1" is confirmed against the EMA UI; the others are inferred from
-# the order of the mode dropdown (Backup / Self-Consumption / Advanced /
-# Peak-Shaving). The API manual documents no mapping at all.
+# The API manual documents no mapping at all. "1" and "3" are confirmed against
+# the EMA app: 3 is the APEMS schedule, which the app's Work Mode page calls
+# "Time-Based Control". "0" and "2" are inferred from the order of the old
+# mode dropdown (Backup / Self-Consumption / Advanced / Peak-Shaving), which
+# proved wrong at 3 — treat them as unconfirmed.
 STORAGE_MODES = {
     "0": "Backup power supply",
     "1": "Self-Consumption",
     "2": "Advanced",
-    "3": "Peak-Shaving",
+    "3": "Time-Based Control",
 }
+STORAGE_MODES_CONFIRMED = {"1", "3"}
+
+
+def _reading_is_fresh(data: dict, max_age_s: int | None) -> bool:
+    """False when the last /storage/latest reading is older than max_age_s.
+
+    A battery reading hours old must not look current: the SoC and mode
+    sensors go unavailable instead. No reading at all is not "stale" — the
+    sensors are then simply unknown.
+    """
+    fetched_at = data.get("storage_latest_fetched_at")
+    if not fetched_at or not max_age_s:
+        return True
+    try:
+        fetched = dt_datetime.fromisoformat(fetched_at)
+    except (TypeError, ValueError):
+        return False
+    return (dt_now() - fetched).total_seconds() <= max_age_s
 
 
 class _APSStorageEntity(APSBaseEntity):
@@ -499,19 +524,34 @@ class _APSStorageEntity(APSBaseEntity):
         }
 
 
-class APSStorageSoCSensor(_APSStorageEntity):
+class _APSStorageLatestEntity(_APSStorageEntity):
+    """A battery sensor read from /storage/latest, unavailable once stale."""
+
+    def __init__(self, coordinator, sid: str, suffix: str, name: str,
+                 max_age_s: int | None = None):
+        super().__init__(coordinator, sid, suffix, name)
+        self._max_age_s = max_age_s
+
+    @property
+    def available(self) -> bool:
+        return super().available and _reading_is_fresh(self._data, self._max_age_s)
+
+
+class APSStorageSoCSensor(_APSStorageLatestEntity):
     """Battery state of charge at the time of the last fetch.
 
-    NOT live: the storage endpoints are polled once daily, so this is a point
-    reading. The `reading_time` attribute carries the API's own timestamp.
+    NOT live: a point reading, once a day or once an hour depending on the
+    poll_storage_hourly option. `reading_time` is the API's own HH:MM;
+    `fetched_at` is when it was fetched. Unavailable once the reading is older
+    than the poll schedule allows.
     """
 
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = PERCENTAGE
 
-    def __init__(self, coordinator, sid: str):
-        super().__init__(coordinator, sid, "soc", "State of Charge")
+    def __init__(self, coordinator, sid: str, max_age_s: int | None = None):
+        super().__init__(coordinator, sid, "soc", "State of Charge", max_age_s)
 
     @property
     def native_value(self) -> StateType:
@@ -523,17 +563,18 @@ class APSStorageSoCSensor(_APSStorageEntity):
         latest = _safe_dict(self._data.get("storage_latest"))
         return {
             "reading_time": latest.get("time"),
+            "fetched_at": self._data.get("storage_latest_fetched_at"),
             "charge_w": _safe_float(latest.get("charge")),
             "discharge_w": _safe_float(latest.get("discharge")),
             "source": "APsystems OpenAPI (storage/latest)",
         }
 
 
-class APSStorageModeSensor(_APSStorageEntity):
+class APSStorageModeSensor(_APSStorageLatestEntity):
     """Battery working mode, decoded from the undocumented numeric field."""
 
-    def __init__(self, coordinator, sid: str):
-        super().__init__(coordinator, sid, "mode", "Mode")
+    def __init__(self, coordinator, sid: str, max_age_s: int | None = None):
+        super().__init__(coordinator, sid, "mode", "Mode", max_age_s)
 
     @property
     def native_value(self) -> StateType:
@@ -549,8 +590,7 @@ class APSStorageModeSensor(_APSStorageEntity):
         raw = str(latest.get("mode", ""))
         return {
             "raw_mode": raw,
-            # Only "1" has been verified against the EMA web UI.
-            "mapping_confirmed": raw == "1",
+            "mapping_confirmed": raw in STORAGE_MODES_CONFIRMED,
         }
 
 
@@ -596,3 +636,34 @@ class APSStorageDailyEnergySensor(_APSStorageEntity):
         except (KeyError, TypeError, ValueError):
             pass
         return attrs
+
+
+class APSApiCallsSensor(APSBaseEntity):
+    """API calls this integration has made this calendar month.
+
+    Counted by the integration itself, because the APsystems portal's counter
+    lags by days. Includes failed requests, which count against the quota too.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:counter"
+    _attr_name = "API calls this month"
+
+    def __init__(self, coordinator, sid: str, call_count: dict):
+        super().__init__(coordinator, sid, "api_calls_month")
+        self._call_count = call_count
+
+    @property
+    def native_value(self) -> StateType:
+        return self._call_count.get("calls")
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "month": self._call_count.get("month"),
+            # True until the first month counted from its start: the value
+            # then includes an estimate of the calls made before counting began.
+            "estimated": bool(self._call_count.get("estimated")),
+            "monthly_quota": MONTHLY_API_QUOTA,
+            "hourly_poll_cap": STORAGE_POLL_MONTHLY_CAP,
+        }

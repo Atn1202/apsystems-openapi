@@ -73,5 +73,8 @@ class APSOptionsFlow(config_entries.OptionsFlow):
                 int, vol.Range(min=1800, max=7200)
             ),
             vol.Optional("poll_pv", default=current.get("poll_pv", True)): bool,
+            vol.Optional(
+                "poll_storage_hourly", default=current.get("poll_storage_hourly", False)
+            ): bool,
         })
         return self.async_show_form(step_id="init", data_schema=schema)

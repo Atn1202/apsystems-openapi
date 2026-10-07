@@ -105,9 +105,10 @@ class APSRefreshInverterEnergyButton(_APSButtonBase):
 class APSRefreshStorageButton(_APSButtonBase):
     """Button to manually fetch battery state and the previous day's balance.
 
-    Storage data is otherwise fetched once daily at 00:30. This button exists
-    so the data can be pulled on demand without waiting — and so no fetch
-    happens automatically on startup, which would cost 2 API calls per restart.
+    Storage data is otherwise fetched daily at 00:30 (and the battery state
+    hourly, if that option is on). Restarts restore it from the on-disk
+    archive, so pressing this is only needed before the first archive exists.
+    Costs 2 calls, or 3 with the hourly poll on (the hourly series too).
     """
 
     _attr_name = "Refresh Storage Data"
@@ -119,7 +120,7 @@ class APSRefreshStorageButton(_APSButtonBase):
     async def async_press(self) -> None:
         store = self._store
         _LOGGER.info("Manual storage refresh triggered")
-        latest = await store["refresh_storage"]()
+        latest = await store["refresh_storage"](include_latest=True)
         if latest:
             _LOGGER.info("Storage refresh complete: SoC %s%%", latest.get("soc"))
         else:

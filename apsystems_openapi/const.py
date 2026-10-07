@@ -45,6 +45,9 @@ DEFAULT_SCAN_INTERVAL = 3600  # seconds (hourly energy)
 # With poll_pv False the entire cloud PV path disappears and only the two
 # daily storage calls remain: ≈ 62 calls/month regardless of interval or
 # latitude.  In that configuration the scan interval has no effect on quota.
+# Adding the hourly storage poll (poll_storage_hourly) brings it to
+# 31 × (2 + 24) ≈ 806 calls/month — which is why it is off by default, and why
+# it cannot be combined with poll_pv without exceeding the quota.
 
 # ── API rate-limit / access-limit response codes ───────────────────────────
 # APsystems returns HTTP 200 with one of these codes in the JSON body when the
@@ -64,9 +67,31 @@ MIN_SCAN_INTERVAL = 1800   # 30 min — API floor enforced by config_flow
 MAX_SCAN_INTERVAL = 7200   # 2 hours
 SCAN_INTERVAL_STEP = 300   # round recommendations up to a clean 5-min step
 
-# Storage endpoints: /storage/latest + /storage/period, fetched once daily at
-# 00:30.  Independent of poll_pv — the battery data has no local source.
+# Storage endpoints, fetched once daily at 00:30.  Independent of poll_pv — the
+# battery data has no local source.  Two calls either way: /storage/latest +
+# /storage/period minutely, or — when the hourly poll below already supplies
+# the latest reading — /storage/period minutely + /storage/period hourly.
 STORAGE_CALLS_PER_DAY = 2
+
+# Optional hourly /storage/latest poll (option poll_storage_hourly): one call
+# at STORAGE_POLL_MINUTE past every hour, round the clock — 24 a day, ~744 in a
+# 31-day month.  The cloud runs ~5 minutes behind, so a :05 poll reads the
+# state at the top of the hour.  Polls stop for the rest of the month once the
+# integration's own call count reaches STORAGE_POLL_MONTHLY_CAP, which keeps
+# the quota for the daily 00:30 fetch, restarts and the refresh buttons.
+STORAGE_POLL_CALLS_PER_DAY = 24
+STORAGE_POLL_MINUTE = 5
+STORAGE_POLL_MONTHLY_CAP = 900
+
+# A /storage/latest reading older than this makes the SoC and mode sensors
+# unavailable rather than showing an old value as if it were current: a little
+# over two missed polls when polling hourly, a little over a day otherwise.
+STORAGE_LATEST_MAX_AGE_HOURLY_S = 3 * 3600
+STORAGE_LATEST_MAX_AGE_DAILY_S = 26 * 3600
+
+# Folder under the HA config directory holding the storage archive
+# (storage_archive.py).
+ARCHIVE_DIR = "apsystems_openapi"
 
 # Monthly call quota and the fraction of it we actually budget for (head-room
 # for manual refreshes, restarts, the inverter-list button, etc.).
@@ -103,6 +128,7 @@ def estimate_monthly_calls(
     sunrise_offset_min: int = 30,
     poll_pv: bool = True,
     has_storage: bool = False,
+    storage_hourly: bool = False,
 ) -> int:
     """Estimate worst-case monthly API calls for a given scan interval.
 
@@ -112,7 +138,8 @@ def estimate_monthly_calls(
         num_inverters (per-inverter energy) + num_ecus (batch power).
 
     Storage path (only when has_storage is True): STORAGE_CALLS_PER_DAY,
-    fetched once daily and unaffected by poll_pv or by the interval.
+    fetched once daily and unaffected by poll_pv or by the interval, plus
+    STORAGE_POLL_CALLS_PER_DAY when the hourly poll (storage_hourly) is on.
 
     With poll_pv False the whole PV path is skipped by the coordinator, so the
     interval and latitude stop influencing the result entirely.
@@ -126,6 +153,8 @@ def estimate_monthly_calls(
 
     if has_storage:
         daily += STORAGE_CALLS_PER_DAY
+        if storage_hourly:
+            daily += STORAGE_POLL_CALLS_PER_DAY
 
     return round(DAYS_PER_MONTH * daily)
 
@@ -139,6 +168,7 @@ def recommended_scan_interval(
     safety: float = API_QUOTA_SAFETY,
     poll_pv: bool = True,
     has_storage: bool = False,
+    storage_hourly: bool = False,
 ) -> int:
     """Smallest scan interval (seconds) that keeps the busiest month under quota.
 
@@ -157,6 +187,8 @@ def recommended_scan_interval(
     daily_fixed = 2 + num_inverters + num_ecus
     if has_storage:
         daily_fixed += STORAGE_CALLS_PER_DAY
+        if storage_hourly:
+            daily_fixed += STORAGE_POLL_CALLS_PER_DAY
 
     budget_per_day = (quota * safety) / DAYS_PER_MONTH
     remaining = budget_per_day - daily_fixed
